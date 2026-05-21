@@ -2,7 +2,11 @@ import os
 import random
 
 import pandas as pd
-from autogluon.tabular import TabularPredictor
+
+# autogluon is only needed by automl_filter (training-time AutoML pre-filtering).
+# Import it lazily inside that function so plain inference doesn't pay the
+# multi-minute import cost (and so the inference path works without autogluon
+# installed at all).
 
 
 def df_serializer(data: pd.DataFrame, mode):
@@ -60,7 +64,11 @@ def one_pos_two_neg(train_df, dataset_dir):
               f'with one_pos_two_neg to maximally 1200 pairs.', flush=True)
         train_pos_pairs = train_df[train_df['label'] == 1]
         train_neg_pairs = train_df[train_df['label'] == 0]
-        train_neg_pairs_sampled = train_neg_pairs.sample(n=2*len(train_pos_pairs), random_state=42)
+        # Cap negative sample size at the number of negatives available — WDC and other
+        # near-balanced datasets have fewer negatives than 2*positives, which crashes
+        # the upstream `sample(n=..., replace=False)` call.
+        neg_n = min(2 * len(train_pos_pairs), len(train_neg_pairs))
+        train_neg_pairs_sampled = train_neg_pairs.sample(n=neg_n, random_state=42)
         train_df_sampled = pd.concat([train_pos_pairs, train_neg_pairs_sampled])
         train_num = min(1200, len(train_df_sampled))
         train_df_sampled = train_df_sampled.sample(n=train_num, random_state=42).reset_index(drop=True)

@@ -11,7 +11,10 @@ from model import load_model
 
 def get_loo_dirs(dataset_name):
     dataset_names = ['abt', 'amgo', 'beer', 'dbac', 'dbgo', 'foza', 'itam', 'waam', 'wdc']
-    loo_dataset_names = [dn for dn in dataset_names if dn != dataset_name]
+    if dataset_name == 'none':
+        loo_dataset_names = dataset_names
+    else:
+        loo_dataset_names = [dn for dn in dataset_names if dn != dataset_name]
     loo_dataset_dirs = [f'data/prepared/{dn}' for dn in loo_dataset_names]
     return loo_dataset_dirs
 
@@ -24,6 +27,8 @@ parser.add_argument('--serialization_mode', type=str, default='mode1')
 parser.add_argument('--row_sample_func', type=str, default='automl_filter')
 parser.add_argument('--train_data', type=str, default='row', choices=['row', 'attr+row', 'attr-row'])
 parser.add_argument('--patience_start', type=int, default=20)
+parser.add_argument('--save_model_path', type=str, default='',
+                    help='Directory to persist the best checkpoint. If empty, the model is not saved.')
 args = parser.parse_args()
 
 seed = args.seed
@@ -33,6 +38,10 @@ serialization_mode = args.serialization_mode
 row_sample_func = args.row_sample_func
 train_data = args.train_data
 patience_start = args.patience_start
+save_model_path = args.save_model_path
+save_model = bool(save_model_path)
+if save_model:
+    os.makedirs(save_model_path, exist_ok=True)
 
 model, tokenizer = load_model(base_model)
 dataset_dirs = get_loo_dirs(leaved_dataset_name)
@@ -91,10 +100,15 @@ print(f'The size of the training and validation datasets are: {len(train_d)}, {l
 print(f'Here is the configuration for the experiment:\n'
       f'\tseed: {seed}\tbase_model: {base_model}\tdataset_name: {leaved_dataset_name}\tmode: {serialization_mode} '
       f'\tmax_len: {350}\tlr: {lr}\tbatch_size: {tbs}\tpatience: {6}\tp_start: {patience_start}', flush=True)
-best_model = train(tokenizer, model, train_d, valid_d, epochs=50, lr=lr, seed=seed, patient=True, save_model=False,
-                   save_freq=50, train_batch_size=tbs, valid_batch_size=128, save_model_path='',
-                   save_result_prefix='', patience=6, patience_start=patience_start, base_model=base_model)
+best_model = train(tokenizer, model, train_d, valid_d, epochs=50, lr=lr, seed=seed, patient=True,
+                   save_model=save_model, save_freq=50, train_batch_size=tbs, valid_batch_size=128,
+                   save_model_path=save_model_path, save_result_prefix='', patience=6,
+                   patience_start=patience_start, base_model=base_model)
 print('The training phase is finished.', flush=True)
+if save_model:
+    # Persist the tokenizer alongside the model so inference scripts can load both from one directory.
+    tokenizer.save_pretrained(save_model_path)
+    print(f'Best checkpoint saved to {save_model_path}', flush=True)
 
 print('Start the evaluation phase.')
 dataset_names = ['abt', 'amgo', 'beer', 'dbac', 'dbgo', 'foza', 'itam', 'waam', 'wdc']

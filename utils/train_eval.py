@@ -198,3 +198,38 @@ def inference(tokenizer, model, test_dataset, batch_size, base_model):
     print(gts, flush=True)
     test_f1, test_acc = compute_metrics(preds, gts)
     return test_f1, test_acc
+
+
+@torch.no_grad()
+def predict(tokenizer, model, test_dataset, batch_size, base_model):
+    """Run prediction without ground-truth labels. Returns (preds, probs) aligned to dataset order.
+
+    preds: list of 0/1 (gpt/bert) or decoded strings (t5)
+    probs: list of P(label==1). For t5 the probability is left as None per-row.
+    """
+    test_dl = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=test_dataset.collate_fn)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if torch.cuda.device_count() > 1:
+        model = torch.nn.DataParallel(model)
+    model.to(device)
+    model.eval()
+
+    preds, probs = [], []
+    for batch in test_dl:
+        batch = {k: v.to(device) for k, v in batch.items()}
+        output = model(**batch)
+        if 'gpt' in base_model or 'bert' in base_model:
+            logits = output[1] if isinstance(output, tuple) else output.logits
+            logits = logits.detach()
+            probs_batch = torch.softmax(logits.float(), dim=-1)[:, 1].cpu().numpy().tolist()
+            preds_batch = logits.argmax(dim=-1).cpu().numpy().flatten().tolist()
+            preds += preds_batch
+            probs += probs_batch
+        elif 't5' in base_model:
+            decoded = tokenizer.batch_decode(torch.argmax(output.logits, dim=-1).detach().cpu().numpy(),
+                                             skip_special_tokens=True)
+            preds += decoded
+            probs += [None] * len(decoded)
+        else:
+            raise ValueError('Invalid model')
+    return preds, probs
