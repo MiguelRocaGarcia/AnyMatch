@@ -1,5 +1,5 @@
-saved_models/
+saved_models/*
 anymatch_model.zip
-data/raw/
-data/prepared/
-data/alliance/
+data/raw/*
+data/prepared/*
+data/alliance/*
