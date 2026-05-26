@@ -11,7 +11,7 @@ A **patched fork** of [Jantory/anymatch](https://github.com/Jantory/anymatch) (Z
 ## Workflow at a glance
 
 1. **Data prep** (local): `data/preprocess.ipynb` consumes `data/raw/` → produces `data/prepared/<dataset>/{train,valid,test}.csv` + `attr_*.csv`.
-2. **Train** (Colab Pro A100): `anymatch_training.ipynb` runs `loo.py --leaved_dataset_name none` on all 9 datasets; ~30–60 min; checkpoint backed up to Drive at `MyDrive/AnyMatch/checkpoints/anymatch_all9_gpt2/`.
+2. **Train** (Colab Pro A100): `anymatch_training.ipynb` runs `loo.py --leaved_dataset_name none` on all 9 datasets; ~30–60 min; checkpoint backed up to Drive at `MyDrive/AnyMatch/checkpoints/anymatch_all9_gpt2_mode4/`. (The previous `anymatch_all9_gpt2/` mode1 checkpoint is kept around for A/B comparison.)
 3. **Sanity-check inference** (local): `anymatch_synthetic_inference.ipynb` runs `predict_alliance.py` on `data/synthetic/alliance_pairs_synthetic.csv` (18 hand-crafted patient pairs).
 4. **Real inference** (local for small batches, Colab for full 212k): `anymatch_alliance_inference.ipynb` joins the blocking output `data/alliance/candidate_pairs_*.parquet` with `data/alliance/MDM_Population_cleaned_v1.csv`, filters `valid_record=True`, and scores via `predict_alliance.py`.
 
@@ -33,7 +33,7 @@ A **patched fork** of [Jantory/anymatch](https://github.com/Jantory/anymatch) (Z
 ## Model mechanics (important when changing the prompt or features)
 
 - Base: `GPT2ForSequenceClassification` (GPT-2 124M + `Linear(768, 2)` head). **Not** a generator — the classification head reads the hidden state of the last non-padding token. `softmax(logits, dim=-1)[:, 1]` = `match_prob`.
-- Serialization (`utils/data_utils.py::df_serializer`, default `mode1`) is **positional**: each pair becomes one string `Record A is <p>COL v1, COL v2, ...</p>. Record B is <p>...</p>. Given the attributes of the two records, are they the same?`. No attribute names appear (mode4 does include names, but training was done with mode1 — mismatching them at inference hurts accuracy).
+- Serialization (`utils/data_utils.py::df_serializer`). The production checkpoint is trained with **mode4**: each pair becomes `Given the attributes of two records, are they the same? Record A is name: <v>, dob: <v>, ssn: <v>, .... Record B is name: <v>, dob: <v>, ssn: <v>, ....`. Attribute names come from the dataframe column names (sans `_l`/`_r`), so the alliance inference notebook applies a `FEATURE_RENAMES` map to convert technical MDM column names (`BirthDT_clean`, `ZipCD_clean_base`) to clean lowercase English (`dob`, `zip`) — that's what the model saw during training and any drift hurts accuracy. The old **mode1** checkpoint (positional `COL v1, COL v2, ...` template, no attribute names) is kept at `saved_models/anymatch_all9_gpt2/` for A/B. Inference and training serialization mode must always match the checkpoint.
 - Missing values are replaced with the literal string `'N/A'` via `.fillna('N/A')` — the model has seen this thousands of times in training and treats both-sides-`N/A` as neutral.
 - GPT-2 context cap is **1024 tokens**. With ~10 feature columns per side, real patient pairs fit comfortably; check token length with `tokenizer.encode(text)` if you add many columns.
 
@@ -43,9 +43,9 @@ Train (run from the AnyMatch folder, A100 strongly recommended):
 
 ```sh
 python loo.py --seed 42 --base_model gpt2 --leaved_dataset_name none \
-    --serialization_mode mode1 --train_data attr+row \
+    --serialization_mode mode4 --train_data attr+row \
     --row_sample_func one_pos_two_neg --patience_start 20 \
-    --save_model_path saved_models/anymatch_all9_gpt2
+    --save_model_path saved_models/anymatch_all9_gpt2_mode4
 ```
 
 `one_pos_two_neg` skips the autogluon dependency (~1 GB). For the paper's best result use `automl_filter` instead, which requires running the AutoML cell in `data/preprocess.ipynb` and installing autogluon.
@@ -54,10 +54,12 @@ Predict on an unlabeled pairs CSV:
 
 ```sh
 python predict_alliance.py \
-    --model_path saved_models/anymatch_all9_gpt2 \
-    --base_model gpt2 --serialization_mode mode1 \
+    --model_path saved_models/anymatch_all9_gpt2_mode4 \
+    --base_model gpt2 --serialization_mode mode4 \
     --input_csv <pairs>.csv --output_csv <predictions>.csv --batch_size 32
 ```
+
+`predict_alliance.py`'s `--serialization_mode` defaults to `mode1` for backward compatibility — always pass `--serialization_mode mode4` explicitly when using the mode4 checkpoint.
 
 ## Gotchas (learned the hard way)
 

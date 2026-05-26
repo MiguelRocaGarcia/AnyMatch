@@ -10,8 +10,9 @@ Local-fork notes for running [Jantory/anymatch](https://github.com/Jantory/anyma
 | `utils/train_eval.py` | Added `predict()` — returns per-row label + match probability without needing ground truth. |
 | `utils/data_utils.py` | Dropped unused top-level `from autogluon.tabular import TabularPredictor` (it was hanging local imports for several minutes). Also capped `one_pos_two_neg` negative sampling at `len(neg_pairs)` so near-balanced datasets like WDC don't crash. |
 | `predict_alliance.py` | New CLI that loads a saved checkpoint, runs `predict()` on a pairs CSV, and writes `pred` + `match_prob` columns. |
-| `anymatch_colab.ipynb` | Colab Pro A100 notebook: install, train, infer. |
-| `anymatch_inference.ipynb` | Local Mac inference notebook: loads the downloaded checkpoint and scores synthetic / real patient pairs. |
+| `anymatch_training.ipynb` | Colab Pro A100 notebook: install, train (`--serialization_mode mode4` → `saved_models/anymatch_all9_gpt2_mode4/`), back up to Drive, sanity-check on a public test set. |
+| `anymatch_synthetic_inference.ipynb` | Local Mac inference on the 18-pair synthetic CSV. Uses `--serialization_mode mode4` and the mode4 checkpoint. |
+| `anymatch_alliance_inference.ipynb` | Local Mac inference on real candidate pairs. Joins blocking output with cleaned MDM population, applies a `FEATURE_RENAMES` map (MDM column names → semantic English like `dob`, `ssn`, `zip`), then calls `predict_alliance.py --serialization_mode mode4`. |
 | `data/synthetic/alliance_pairs_synthetic.csv` | 18 hand-crafted patient pairs (10 matches, 8 non-matches) used by the inference notebook for sanity checking. |
 
 ## Workflow
@@ -27,10 +28,10 @@ Local-fork notes for running [Jantory/anymatch](https://github.com/Jantory/anyma
    - Cell 30: `prepare_all_attribute_pairs(...)` enabled (required for `--train_data attr+row`).
    - Cell 34: AutoML still commented out — only needed if you want `--row_sample_func automl_filter` (paper's best). The default training command in `anymatch_colab.ipynb` uses `one_pos_two_neg` to skip the heavy autogluon install.
 3. **Upload to Drive:** zip this folder → `MyDrive/AnyMatch.zip`. Upload `data/prepared/` → `MyDrive/AnyMatch/prepared/`.
-4. **Train on Colab Pro (A100):** open `anymatch_colab.ipynb`, run cells top-to-bottom. ~30–60 min. Checkpoint backed up to `MyDrive/AnyMatch/checkpoints/anymatch_all9_gpt2/`.
+4. **Train on Colab Pro (A100):** open `anymatch_training.ipynb`, run cells top-to-bottom. ~30–60 min. Trains with `--serialization_mode mode4`; checkpoint backed up to `MyDrive/AnyMatch/checkpoints/anymatch_all9_gpt2_mode4/`. The earlier mode1 checkpoint at `MyDrive/AnyMatch/checkpoints/anymatch_all9_gpt2/` is kept for A/B comparison — leave it in place.
 5. **Patient inference — two options:**
-   - **Colab:** upload pairs CSV to `MyDrive/AnyMatch/alliance/pairs.csv`; the Colab notebook's Section 5 cell produces `predictions.csv` with `pred` and `match_prob`.
-   - **Local Mac:** download `MyDrive/AnyMatch/checkpoints/anymatch_all9_gpt2/` into `AnyMatch/saved_models/anymatch_all9_gpt2/`, launch Jupyter / VS Code from the `AnyMatch/` folder, and run `anymatch_inference.ipynb` top-to-bottom. It runs on the synthetic CSV by default; swap `INPUT_CSV` to your real pairs file when ready. CPU-only is fine for small batches.
+   - **Colab:** upload pairs CSV to `MyDrive/AnyMatch/alliance/pairs.csv`; the Colab training notebook's Section 5 cell (uses `--serialization_mode mode4` against the mode4 checkpoint) produces `predictions.csv` with `pred` and `match_prob`.
+   - **Local Mac:** download `MyDrive/AnyMatch/checkpoints/anymatch_all9_gpt2_mode4/` into `AnyMatch/saved_models/anymatch_all9_gpt2_mode4/`, launch Jupyter / VS Code from the `AnyMatch/` folder, and run `anymatch_synthetic_inference.ipynb` (18 hand-crafted pairs, has ground-truth labels) or `anymatch_alliance_inference.ipynb` (real candidate pairs from blocking). Both notebooks default to the mode4 checkpoint and pass `--serialization_mode mode4`. CPU-only is fine for small batches; full 212k-pair runs should go to Colab GPU.
 
 ## Pairs CSV format
 

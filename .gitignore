@@ -1,5 +1,6 @@
 saved_models/*
-anymatch_model.zip
+anymatch_model_mode1.zip
+anymatch_all9_gpt2_mode4.zip
 data/raw/*
 data/prepared/*
 data/alliance/*
