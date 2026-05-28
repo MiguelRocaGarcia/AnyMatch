@@ -29,6 +29,18 @@ A **patched fork** of [Jantory/anymatch](https://github.com/Jantory/anymatch) (Z
 - `predict_alliance.py` — inference CLI. Reads any CSV with `*_l` / `*_r` columns + optional `label`, writes the same CSV + `pred` / `match_prob`. Other columns (e.g. `PATID_A`, `PATID_B`) ride through untouched because `df_serializer` only consumes `_l` / `_r`-suffixed columns.
 - `anymatch_training.ipynb`, `anymatch_synthetic_inference.ipynb`, `anymatch_alliance_inference.ipynb` — the three end-to-end notebooks.
 - `data/synthetic/alliance_pairs_synthetic.csv` — 18 hand-crafted pairs (10 matches, 8 non-matches) for sanity-checking before real data.
+- `docs/Data-Cleaning-Guide.md` — field-by-field cleaning rules applied to MDM_Population to produce `*_clean` columns + `valid_record` + derived `full_name_tokens` / `Phones_set` / `Address_normalized`. Any synthetic data we generate must conform to these conventions.
+- `synthetic_data_generation/` — design + tooling for a domain-shift fine-tuning corpus (see next section).
+
+## Synthetic fine-tuning corpus (in design)
+
+The zero-shot mode4 checkpoint underperforms on FQHC patient pairs in two specific ways: it doesn't treat matching SSN as decisive, and it treats `FirstNM` / `MiddleNM` / `LastNM` as independent (they aren't — clerical entry routinely shuffles tokens across the three fields). Fix is to fine-tune on a synthetic, AllianceChicago-shaped pair corpus.
+
+- `synthetic_data_generation/Synthetic-Dataset-Spec.md` — design doc (v0.1 scaffold). Defines purpose, generation schema (MDM-cleaned drop-in), entity-first + case-first hybrid generation, full scenario catalog (match: SSN-led, name-coupling-led, DOB, address, phone/email/sex/mixed; non-match: easy, hard household, common-name, SSN-quality, identity-fragment, boundary; explicit policy-ambiguous cases), entity-disjoint train/test split, output CSV layout, sanity checks. Sections marked **[TBD]** depend on real-data stats.
+- `synthetic_data_generation/extract_mdm_stats.py` — emits aggregate statistics (k-anonymized top-N, missingness, length/token/DOB/SSN/phone/email/address/cluster histograms) from `MDM_Population_cleaned_v1.csv` to `synthetic_data_generation/synthetic_data_stats.json`. **Aggregates only — no raw rows.** Run locally; the JSON output is safe to commit.
+- Two-stage output plan: balanced/oversampled fine-tune corpus + realistic-distribution holdout eval. Entity-disjoint split shared across both. Output drops into `data/synthetic/` with `_v{N}` versioning to match the cleaning-output convention.
+
+The spec is being **cooked slowly** — iterate on the catalog and prevalence numbers before building the generator. Generator script and QA notebook are deferred until the spec stabilizes.
 
 ## Model mechanics (important when changing the prompt or features)
 
@@ -82,7 +94,12 @@ utils/
 data/
   raw/<dataset>/       # 8 Magellan deepmatcher zips + WDC
   prepared/<dataset>/  # output of preprocess.ipynb
-  synthetic/           # alliance_pairs_synthetic.csv
+  synthetic/           # alliance_pairs_synthetic.csv + (future) finetune_train/test, realistic_eval
   alliance/            # candidate_pairs_*.parquet, MDM_Population_cleaned_v1.csv
+docs/
+  Data-Cleaning-Guide.md   # MDM cleaning rules (drives synthetic-data conventions)
+synthetic_data_generation/
+  Synthetic-Dataset-Spec.md # scenario catalog + generation plan (v0.1 scaffold)
+  extract_mdm_stats.py      # aggregate-stats extractor for spec [TBD]s
 saved_models/          # trained checkpoints (download from Drive)
 ```
