@@ -17,7 +17,9 @@ for PHI reasons; pass an absolute path.
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
+import random
 import re
 from collections import Counter
 from pathlib import Path
@@ -344,6 +346,289 @@ def cluster_stats_by_key(df: pd.DataFrame, keys: list[str], label: str) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Within-cluster field agreement (true-positive proxy) and joint distributions.
+# These calibrate the synthetic corruption model (Spec §7) and the correlated
+# entity sampling (Spec §6) from real data. All outputs are aggregate rates /
+# counts only -- no raw values escape, so they remain k-anon safe.
+# ---------------------------------------------------------------------------
+
+def _levenshtein(a: str, b: str, max_d: int = 4) -> int:
+    """Plain Levenshtein edit distance with an early-exit length gate."""
+    if a == b:
+        return 0
+    la, lb = len(a), len(b)
+    if abs(la - lb) > max_d:
+        return max_d + 1
+    prev = list(range(lb + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i] + [0] * lb
+        for j, cb in enumerate(b, 1):
+            cost = 0 if ca == cb else 1
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+        prev = cur
+    return prev[lb]
+
+
+def _dob_relation(a, b) -> str:
+    """Classify the relationship between two parsed DOB timestamps."""
+    if pd.isna(a) or pd.isna(b):
+        return "missing"
+    if a == b:
+        return "exact"
+    # Month/day transposition (e.g. 1985-01-15 vs 1985-10-15), valid only when
+    # both day and month are <= 12.
+    if a.year == b.year and a.month == b.day and a.day == b.month:
+        return "month_day_transpose"
+    if a.month == b.month and a.day == b.day and abs(a.year - b.year) == 1:
+        return "off_by_one_year"
+    if a.year == b.year and a.month == b.month and abs(a.day - b.day) == 1:
+        return "off_by_one_day"
+    return "other"
+
+
+def _val(d: dict, idx):
+    """Fetch a cell from a column-as-dict, returning None for NaN/missing."""
+    v = d.get(idx)
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return None
+    return v
+
+
+def within_cluster_agreement(
+    df: pd.DataFrame, key_cols: list[str], label: str,
+    seed: int = 0, max_pairs: int = 300_000,
+) -> dict:
+    """Field-agreement rates over within-cluster record *pairs*, where a cluster
+    is a group sharing `key_cols` (a same-person proxy -- strongest for full
+    `SSN_clean`). This is the empirical corruption model that Spec §7 budgets
+    should be calibrated against (Spec §5.9).
+
+    Rates are conditional: each metric's denominator is the number of pairs
+    where the relevant field is present on *both* sides.
+    """
+    cols = [c for c in key_cols if c in df.columns]
+    if len(cols) != len(key_cols):
+        return {"note": f"missing one of {key_cols}"}
+    sub = df.dropna(subset=cols)
+    if sub.empty:
+        return {"label": label, "n_pairs": 0}
+
+    rng = random.Random(seed)
+    pairs: list[tuple] = []
+    n_clusters_multi = 0
+    for _, idx in sub.groupby(cols).groups.items():
+        idx = list(idx)
+        if len(idx) < 2:
+            continue
+        n_clusters_multi += 1
+        pairs.extend(itertools.combinations(idx, 2))
+    n_pairs_total = len(pairs)
+    if n_pairs_total == 0:
+        return {"label": label, "n_pairs": 0, "n_clusters_multi_record": 0}
+    sampled = n_pairs_total > max_pairs
+    if sampled:
+        pairs = rng.sample(pairs, max_pairs)
+
+    fields = [
+        "FirstNM_clean", "LastNM_clean", "MiddleNM_clean",
+        "full_name_compact", "full_name_tokens",
+        "AddressLine1_clean", "CityNM_clean", "StateCD_clean",
+        "ZipCD_clean_base", "Phones_set", "Email_clean", "SexAtBirthDSC_clean",
+    ]
+    data = {f: df[f].to_dict() for f in fields if f in df.columns}
+    dob = (
+        pd.to_datetime(df["BirthDT_clean"], errors="coerce").to_dict()
+        if "BirthDT_clean" in df.columns else {}
+    )
+
+    agree: Counter = Counter()   # numerator: # pairs that agree on metric
+    denom: Counter = Counter()   # denominator: # pairs where metric is defined
+
+    def both(field, i, j):
+        a = _val(data.get(field, {}), i)
+        b = _val(data.get(field, {}), j)
+        return a, b
+
+    for i, j in pairs:
+        # --- name fields ---
+        for fld, key in (("FirstNM_clean", "first_exact"),
+                         ("LastNM_clean", "last_exact")):
+            a, b = both(fld, i, j)
+            if a is not None and b is not None:
+                denom[key] += 1
+                agree[key] += int(a == b)
+
+        a, b = both("full_name_compact", i, j)
+        if a is not None and b is not None:
+            denom["name_compact_exact"] += 1
+            agree["name_compact_exact"] += int(a == b)
+            d = _levenshtein(str(a), str(b))
+            denom["name_compact_editdist_le1"] += 1
+            agree["name_compact_editdist_le1"] += int(d <= 1)
+            denom["name_compact_editdist_le2"] += 1
+            agree["name_compact_editdist_le2"] += int(d <= 2)
+
+        a, b = both("full_name_tokens", i, j)
+        if a is not None and b is not None:
+            denom["name_tokens_set_equal"] += 1
+            agree["name_tokens_set_equal"] += int(set(str(a).split()) == set(str(b).split()))
+
+        # middle-name behaviour: agreement when both present; one-missing rate.
+        a, b = both("MiddleNM_clean", i, j)
+        denom["middle_pairs"] += 1
+        if a is not None and b is not None:
+            denom["middle_both_present"] += 1
+            agree["middle_both_present_equal"] += int(a == b)
+        if (a is None) != (b is None):
+            agree["middle_exactly_one_missing"] += 1
+
+        # --- DOB ---
+        if dob:
+            rel = _dob_relation(dob.get(i), dob.get(j))
+            if rel != "missing":
+                denom["dob_present"] += 1
+                agree[f"dob_{rel}"] += 1
+
+        # --- address / geo ---
+        for fld, key in (("AddressLine1_clean", "address1_exact"),
+                         ("CityNM_clean", "city_exact"),
+                         ("StateCD_clean", "state_exact"),
+                         ("ZipCD_clean_base", "zip_exact")):
+            a, b = both(fld, i, j)
+            if a is not None and b is not None:
+                denom[key] += 1
+                agree[key] += int(a == b)
+
+        # --- phones (set overlap) ---
+        a, b = both("Phones_set", i, j)
+        if a is not None and b is not None:
+            sa, sb = set(str(a).split()), set(str(b).split())
+            if sa and sb:
+                denom["phone_overlap"] += 1
+                agree["phone_overlap_ge1"] += int(len(sa & sb) >= 1)
+
+        # --- email / sex ---
+        for fld, key in (("Email_clean", "email_exact"),
+                         ("SexAtBirthDSC_clean", "sex_exact")):
+            a, b = both(fld, i, j)
+            if a is not None and b is not None:
+                denom[key] += 1
+                agree[key] += int(a == b)
+
+    def rate(num_key, den_key):
+        d = denom.get(den_key, 0)
+        return {
+            "n": int(agree.get(num_key, 0)),
+            "denom": int(d),
+            "rate": float(agree.get(num_key, 0) / d) if d else None,
+        }
+
+    n = len(pairs)
+    return {
+        "label": label,
+        "n_clusters_multi_record": int(n_clusters_multi),
+        "n_pairs_total": int(n_pairs_total),
+        "n_pairs_sampled": int(n),
+        "sampled": bool(sampled),
+        "name": {
+            "first_exact": rate("first_exact", "first_exact"),
+            "last_exact": rate("last_exact", "last_exact"),
+            "compact_exact": rate("name_compact_exact", "name_compact_exact"),
+            "compact_editdist_le1": rate("name_compact_editdist_le1", "name_compact_editdist_le1"),
+            "compact_editdist_le2": rate("name_compact_editdist_le2", "name_compact_editdist_le2"),
+            "tokens_set_equal": rate("name_tokens_set_equal", "name_tokens_set_equal"),
+        },
+        "middle": {
+            "both_present_equal": rate("middle_both_present_equal", "middle_both_present"),
+            "exactly_one_missing_rate": float(
+                agree.get("middle_exactly_one_missing", 0) / denom["middle_pairs"]
+            ) if denom.get("middle_pairs") else None,
+        },
+        "dob": {
+            rel: rate(f"dob_{rel}", "dob_present")
+            for rel in ("exact", "off_by_one_day", "off_by_one_year",
+                        "month_day_transpose", "other")
+        },
+        "address": {
+            "line1_exact": rate("address1_exact", "address1_exact"),
+            "city_exact": rate("city_exact", "city_exact"),
+            "state_exact": rate("state_exact", "state_exact"),
+            "zip_exact": rate("zip_exact", "zip_exact"),
+        },
+        "phone_overlap_ge1": rate("phone_overlap_ge1", "phone_overlap"),
+        "email_exact": rate("email_exact", "email_exact"),
+        "sex_exact": rate("sex_exact", "sex_exact"),
+    }
+
+
+def geo_joint(df: pd.DataFrame) -> dict:
+    """Joint (City, State, ZIP3) distribution -- lets §6 sample geography as a
+    correlated block instead of three independent marginals."""
+    cols = ["CityNM_clean", "StateCD_clean", "ZipCD_clean_base"]
+    if not all(c in df.columns for c in cols):
+        return {}
+    sub = df[cols].dropna().copy()
+    if sub.empty:
+        return {}
+    sub["zip3"] = sub["ZipCD_clean_base"].astype(str).str[:3]
+    combo = sub["CityNM_clean"].astype(str) + "|" + sub["StateCD_clean"].astype(str) + "|" + sub["zip3"]
+    vc = combo.value_counts()
+    head = vc[vc >= K_ANON_THRESHOLD].head(TOP_N)
+    return {
+        "format": "City|State|ZIP3",
+        "top": {str(k): int(v) for k, v in head.items()},
+        "below_threshold_total": int(vc.sum() - head.sum()),
+        "n_distinct_above_threshold": int((vc >= K_ANON_THRESHOLD).sum()),
+    }
+
+
+def missingness_patterns(df: pd.DataFrame) -> dict:
+    """Joint present/absent pattern over the identifier-bearing fields, so §6
+    can sample realistic *co-missingness* (thin transient records miss SSN +
+    address + phone together) rather than nulling each field independently."""
+    # Single-column bits.
+    key_map = {
+        "ssn_full": "SSN_clean",
+        "ssn_last4": "last_4_SSN",
+        "middle": "MiddleNM_clean",
+        "email": "Email_clean",
+        "sex": "SexAtBirthDSC_clean",
+    }
+    # Composite bits: "address" = any address field present (matches the
+    # "no address at all" 2.4% in co_missingness, i.e. step-6 present-rate
+    # ~0.976); "phone" = any phone slot present (matches the phones-per-record
+    # 0-bucket ~5.6%, i.e. step-7 present-rate ~0.944). Keying these on a single
+    # column (AddressLine1 / PrimaryPhoneNBR) would understate presence and
+    # desync the pattern from the §6 step marginals.
+    addr_cols = [c for c in ["AddressLine1_clean", "CityNM_clean",
+                             "StateCD_clean", "ZipCD_clean_base"] if c in df.columns]
+    phone_cols = [c for c in ["PrimaryPhoneNBR_clean", "Phone01NBR_clean",
+                              "Phone02NBR_clean", "Phone03NBR_clean"] if c in df.columns]
+
+    bits = {name: df[col].notna() for name, col in key_map.items() if col in df.columns}
+    if addr_cols:
+        bits["address"] = df[addr_cols].notna().any(axis=1)
+    if phone_cols:
+        bits["phone"] = df[phone_cols].notna().any(axis=1)
+    if not bits:
+        return {}
+    # Stable, readable field order.
+    desired = ["ssn_full", "ssn_last4", "middle", "address", "email", "phone", "sex"]
+    order = [name for name in desired if name in bits]
+    present = pd.DataFrame({name: bits[name] for name in order})
+    pat = present[order].apply(lambda r: "".join("1" if r[c] else "0" for c in order), axis=1)
+    vc = pat.value_counts()
+    head = vc[vc >= K_ANON_THRESHOLD].head(TOP_N)
+    return {
+        "fields_order": order,
+        "pattern_legend": "each char is 1=present / 0=missing, in fields_order",
+        "top_patterns": {str(k): int(v) for k, v in head.items()},
+        "below_threshold_total": int(vc.sum() - head.sum()),
+        "n_distinct_above_threshold": int((vc >= K_ANON_THRESHOLD).sum()),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--input", required=True, help="Path to MDM_Population_cleaned_v1.csv")
@@ -409,6 +694,22 @@ def main() -> None:
                 "full_name_compact + BirthDT_clean",
             ),
         },
+        # True-positive proxy: field agreement over within-cluster record pairs.
+        # `by_ssn` is the highest-purity same-person signal; calibrates §7
+        # corruption budgets. `by_last4_dob` is lower-purity (last-4 collisions)
+        # and is informative mostly for negative/collision calibration.
+        "within_cluster_agreement": {
+            "by_ssn": within_cluster_agreement(df, ["SSN_clean"], "SSN_clean"),
+            "by_ssn_dob": within_cluster_agreement(
+                df, ["SSN_clean", "BirthDT_clean"], "SSN_clean + BirthDT_clean"
+            ),
+            "by_last4_dob": within_cluster_agreement(
+                df, ["last_4_SSN", "BirthDT_clean"], "last_4_SSN + BirthDT_clean"
+            ),
+        },
+        # Joint distributions for correlated entity sampling (§6).
+        "geo_joint": geo_joint(df),
+        "missingness_patterns": missingness_patterns(df),
     }
 
     out_path = Path(args.output)
