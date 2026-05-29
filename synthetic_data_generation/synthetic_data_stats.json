@@ -983,5 +983,463 @@
         "7": 3
       }
     }
+  },
+  "within_cluster_agreement": {
+    "by_ssn": {
+      "label": "SSN_clean",
+      "n_clusters_multi_record": 3851,
+      "n_pairs_total": 5696,
+      "n_pairs_sampled": 5696,
+      "sampled": false,
+      "name": {
+        "first_exact": {
+          "n": 4716,
+          "denom": 5696,
+          "rate": 0.8279494382022472
+        },
+        "last_exact": {
+          "n": 3946,
+          "denom": 5695,
+          "rate": 0.6928884986830554
+        },
+        "compact_exact": {
+          "n": 2953,
+          "denom": 5696,
+          "rate": 0.5184339887640449
+        },
+        "compact_editdist_le1": {
+          "n": 3751,
+          "denom": 5696,
+          "rate": 0.6585323033707865
+        },
+        "compact_editdist_le2": {
+          "n": 3893,
+          "denom": 5696,
+          "rate": 0.6834620786516854
+        },
+        "tokens_set_equal": {
+          "n": 2926,
+          "denom": 5696,
+          "rate": 0.5136938202247191
+        }
+      },
+      "middle": {
+        "both_present_equal": {
+          "n": 655,
+          "denom": 784,
+          "rate": 0.8354591836734694
+        },
+        "exactly_one_missing_rate": 0.2147120786516854
+      },
+      "dob": {
+        "exact": {
+          "n": 4483,
+          "denom": 5157,
+          "rate": 0.8693038588326546
+        },
+        "off_by_one_day": {
+          "n": 2,
+          "denom": 5157,
+          "rate": 0.00038782237735117316
+        },
+        "off_by_one_year": {
+          "n": 3,
+          "denom": 5157,
+          "rate": 0.0005817335660267597
+        },
+        "month_day_transpose": {
+          "n": 2,
+          "denom": 5157,
+          "rate": 0.00038782237735117316
+        },
+        "other": {
+          "n": 667,
+          "denom": 5157,
+          "rate": 0.12933876284661625
+        }
+      },
+      "address": {
+        "line1_exact": {
+          "n": 1602,
+          "denom": 5553,
+          "rate": 0.2884927066450567
+        },
+        "city_exact": {
+          "n": 4867,
+          "denom": 5617,
+          "rate": 0.8664767669574506
+        },
+        "state_exact": {
+          "n": 5538,
+          "denom": 5594,
+          "rate": 0.9899892742223811
+        },
+        "zip_exact": {
+          "n": 2611,
+          "denom": 5552,
+          "rate": 0.47028097982708933
+        }
+      },
+      "phone_overlap_ge1": {
+        "n": 1956,
+        "denom": 5696,
+        "rate": 0.3433988764044944
+      },
+      "email_exact": {
+        "n": 281,
+        "denom": 499,
+        "rate": 0.56312625250501
+      },
+      "sex_exact": {
+        "n": 4415,
+        "denom": 4825,
+        "rate": 0.9150259067357513
+      }
+    },
+    "by_ssn_dob": {
+      "label": "SSN_clean + BirthDT_clean",
+      "n_clusters_multi_record": 3507,
+      "n_pairs_total": 4499,
+      "n_pairs_sampled": 4499,
+      "sampled": false,
+      "name": {
+        "first_exact": {
+          "n": 4225,
+          "denom": 4499,
+          "rate": 0.9390975772393866
+        },
+        "last_exact": {
+          "n": 3551,
+          "denom": 4498,
+          "rate": 0.7894619831036016
+        },
+        "compact_exact": {
+          "n": 2663,
+          "denom": 4499,
+          "rate": 0.5919093131807068
+        },
+        "compact_editdist_le1": {
+          "n": 3377,
+          "denom": 4499,
+          "rate": 0.7506112469437652
+        },
+        "compact_editdist_le2": {
+          "n": 3511,
+          "denom": 4499,
+          "rate": 0.7803956434763281
+        },
+        "tokens_set_equal": {
+          "n": 2640,
+          "denom": 4499,
+          "rate": 0.58679706601467
+        }
+      },
+      "middle": {
+        "both_present_equal": {
+          "n": 594,
+          "denom": 712,
+          "rate": 0.8342696629213483
+        },
+        "exactly_one_missing_rate": 0.2358301844854412
+      },
+      "dob": {
+        "exact": {
+          "n": 4483,
+          "denom": 4483,
+          "rate": 1.0
+        },
+        "off_by_one_day": {
+          "n": 0,
+          "denom": 4483,
+          "rate": 0.0
+        },
+        "off_by_one_year": {
+          "n": 0,
+          "denom": 4483,
+          "rate": 0.0
+        },
+        "month_day_transpose": {
+          "n": 0,
+          "denom": 4483,
+          "rate": 0.0
+        },
+        "other": {
+          "n": 0,
+          "denom": 4483,
+          "rate": 0.0
+        }
+      },
+      "address": {
+        "line1_exact": {
+          "n": 1446,
+          "denom": 4370,
+          "rate": 0.3308924485125858
+        },
+        "city_exact": {
+          "n": 3903,
+          "denom": 4427,
+          "rate": 0.8816354190196521
+        },
+        "state_exact": {
+          "n": 4368,
+          "denom": 4419,
+          "rate": 0.988458927359131
+        },
+        "zip_exact": {
+          "n": 2299,
+          "denom": 4388,
+          "rate": 0.5239288969917958
+        }
+      },
+      "phone_overlap_ge1": {
+        "n": 1772,
+        "denom": 4499,
+        "rate": 0.3938653034007557
+      },
+      "email_exact": {
+        "n": 255,
+        "denom": 444,
+        "rate": 0.5743243243243243
+      },
+      "sex_exact": {
+        "n": 3682,
+        "denom": 3739,
+        "rate": 0.9847552821610056
+      }
+    },
+    "by_last4_dob": {
+      "label": "last_4_SSN + BirthDT_clean",
+      "n_clusters_multi_record": 8665,
+      "n_pairs_total": 14340,
+      "n_pairs_sampled": 14340,
+      "sampled": false,
+      "name": {
+        "first_exact": {
+          "n": 5175,
+          "denom": 14340,
+          "rate": 0.3608786610878661
+        },
+        "last_exact": {
+          "n": 4449,
+          "denom": 14339,
+          "rate": 0.3102726828928098
+        },
+        "compact_exact": {
+          "n": 3240,
+          "denom": 14340,
+          "rate": 0.22594142259414227
+        },
+        "compact_editdist_le1": {
+          "n": 4151,
+          "denom": 14340,
+          "rate": 0.2894700139470014
+        },
+        "compact_editdist_le2": {
+          "n": 4334,
+          "denom": 14340,
+          "rate": 0.30223152022315203
+        },
+        "tokens_set_equal": {
+          "n": 3211,
+          "denom": 14340,
+          "rate": 0.22391910739191073
+        }
+      },
+      "middle": {
+        "both_present_equal": {
+          "n": 668,
+          "denom": 1051,
+          "rate": 0.6355851569933397
+        },
+        "exactly_one_missing_rate": 0.25613668061366807
+      },
+      "dob": {
+        "exact": {
+          "n": 14295,
+          "denom": 14295,
+          "rate": 1.0
+        },
+        "off_by_one_day": {
+          "n": 0,
+          "denom": 14295,
+          "rate": 0.0
+        },
+        "off_by_one_year": {
+          "n": 0,
+          "denom": 14295,
+          "rate": 0.0
+        },
+        "month_day_transpose": {
+          "n": 0,
+          "denom": 14295,
+          "rate": 0.0
+        },
+        "other": {
+          "n": 0,
+          "denom": 14295,
+          "rate": 0.0
+        }
+      },
+      "address": {
+        "line1_exact": {
+          "n": 1852,
+          "denom": 13918,
+          "rate": 0.13306509555970686
+        },
+        "city_exact": {
+          "n": 9127,
+          "denom": 14191,
+          "rate": 0.6431541117609753
+        },
+        "state_exact": {
+          "n": 13786,
+          "denom": 14174,
+          "rate": 0.9726259348102159
+        },
+        "zip_exact": {
+          "n": 3193,
+          "denom": 14087,
+          "rate": 0.22666288067012139
+        }
+      },
+      "phone_overlap_ge1": {
+        "n": 2273,
+        "denom": 14340,
+        "rate": 0.15850767085076709
+      },
+      "email_exact": {
+        "n": 366,
+        "denom": 3614,
+        "rate": 0.10127282789153293
+      },
+      "sex_exact": {
+        "n": 6700,
+        "denom": 8595,
+        "rate": 0.779522978475858
+      }
+    }
+  },
+  "geo_joint": {
+    "format": "City|State|ZIP3",
+    "top": {
+      "CHICAGO|IL|606": 102959,
+      "LEXINGTON|KY|405": 5014,
+      "CICERO|IL|608": 2191,
+      "BALTIMORE|MD|212": 2163,
+      "EVANSTON|IL|602": 1902,
+      "LOUISVILLE|KY|402": 1839,
+      "WAUKEGAN|IL|600": 1742,
+      "SKOKIE|IL|600": 1730,
+      "CHEYENNE|WY|820": 1634,
+      "BERWYN|IL|604": 1577,
+      "NEW YORK|NY|100": 1406,
+      "CASPER|WY|826": 1133,
+      "OAK PARK|IL|603": 833,
+      "MELROSE PARK|IL|601": 695,
+      "CORTLAND|NY|130": 683,
+      "REDDING|CA|960": 664,
+      "WAILUKU|HI|967": 625,
+      "BRONX|NY|104": 575,
+      "KAHULUI|HI|967": 564,
+      "MAYWOOD|IL|601": 527,
+      "KAMUELA|HI|967": 515,
+      "ELMWOOD PARK|IL|607": 512,
+      "DES PLAINES|IL|600": 507,
+      "HONOKAA|HI|967": 502,
+      "LAHAINA|HI|967": 479,
+      "CHICAGO|IL|607": 463,
+      "KIHEI|HI|967": 423,
+      "CUMBERLAND|MD|215": 335,
+      "LARAMIE|WY|820": 320,
+      "MONTICELLO|IN|479": 314,
+      "NILES|IL|607": 306,
+      "ZION|IL|600": 280,
+      "BELLWOOD|IL|601": 278,
+      "NORTH CHICAGO|IL|600": 259,
+      "CALUMET CITY|IL|604": 253,
+      "ADDISON|IL|601": 246,
+      "GLENVIEW|IL|600": 228,
+      "DELPHI|IN|469": 228,
+      "MORTON GROVE|IL|600": 227,
+      "KAPAAU|HI|967": 216,
+      "FOREST PARK|IL|601": 216,
+      "MAKAWAO|HI|967": 207,
+      "LAIE|HI|967": 201,
+      "FRANKLIN PARK|IL|601": 193,
+      "LINCOLNWOOD|IL|607": 186,
+      "HAUULA|HI|967": 186,
+      "MONON|IN|479": 171,
+      "HOMER|NY|130": 168,
+      "MARATHON|NY|138": 164,
+      "MORAVIA|NY|131": 162
+    },
+    "below_threshold_total": 19051,
+    "n_distinct_above_threshold": 282
+  },
+  "missingness_patterns": {
+    "fields_order": [
+      "ssn_full",
+      "ssn_last4",
+      "middle",
+      "address",
+      "email",
+      "phone",
+      "sex"
+    ],
+    "pattern_legend": "each char is 1=present / 0=missing, in fields_order",
+    "top_patterns": {
+      "0001011": 48524,
+      "0001111": 18802,
+      "0001010": 12424,
+      "1101011": 10863,
+      "0011011": 8490,
+      "0101111": 7929,
+      "1111011": 5943,
+      "1101111": 5492,
+      "0101011": 4842,
+      "1111111": 4520,
+      "0011111": 4212,
+      "0101010": 4042,
+      "1101010": 3198,
+      "0001001": 3058,
+      "0001110": 2890,
+      "0101110": 2000,
+      "0111111": 1958,
+      "0011010": 1461,
+      "1111010": 1243,
+      "1101001": 1129,
+      "1101110": 1105,
+      "0000000": 1008,
+      "0001000": 998,
+      "0111011": 945,
+      "0000001": 920,
+      "0000010": 860,
+      "0111010": 638,
+      "0111110": 460,
+      "1111110": 455,
+      "0011110": 374,
+      "0000110": 352,
+      "0101001": 288,
+      "1111001": 277,
+      "0011001": 252,
+      "1100000": 166,
+      "1110000": 150,
+      "0000011": 140,
+      "0001101": 120,
+      "1101000": 94,
+      "0101000": 89,
+      "1100001": 70,
+      "1110001": 61,
+      "0010001": 56,
+      "1101101": 48,
+      "0100000": 46,
+      "0011000": 41,
+      "1111101": 37,
+      "0100001": 35,
+      "0111001": 28,
+      "1111000": 27
+    },
+    "below_threshold_total": 204,
+    "n_distinct_above_threshold": 51
   }
 }
