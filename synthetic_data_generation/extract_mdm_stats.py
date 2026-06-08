@@ -5,6 +5,15 @@ Outputs only aggregates (counts, rates, histograms, top-N value lists with a
 k-anonymity threshold). No raw rows, no PII strings appearing below the
 threshold count.
 
+Emitted blocks include: per-field missingness + co-missingness, categorical
+top-N, name-token stats, field lengths, DOB/SSN/phone/email/address histograms,
+ZIP3->state agreement, cluster-size histograms, and (added 2026-05-28, all
+aggregate/k-anon-safe and consumed by the synthetic spec §5.8/§5.9):
+  - within_cluster_agreement  -- field-agreement rates over within-cluster
+        record pairs (same-person proxy); calibrates §7 corruption budgets.
+  - geo_joint                 -- joint (City, State, ZIP3) distribution.
+  - missingness_patterns      -- joint present/absent pattern distribution.
+
 Usage:
     python synthetic_data_generation/extract_mdm_stats.py \
         --input  /path/to/MDM_Population_cleaned_v1.csv \

@@ -14,6 +14,10 @@ Local-fork notes for running [Jantory/anymatch](https://github.com/Jantory/anyma
 | `anymatch_synthetic_inference.ipynb` | Local Mac inference on the 18-pair synthetic CSV. Uses `--serialization_mode mode4` and the mode4 checkpoint. |
 | `anymatch_alliance_inference.ipynb` | Local Mac inference on real candidate pairs. Joins blocking output with cleaned MDM population, applies a `FEATURE_RENAMES` map (MDM column names → semantic English like `dob`, `ssn`, `zip`), then calls `predict_alliance.py --serialization_mode mode4`. |
 | `data/synthetic/alliance_pairs_synthetic.csv` | 18 hand-crafted patient pairs (10 matches, 8 non-matches) used by the inference notebook for sanity checking. |
+| `synthetic_data_generation/extract_mdm_stats.py` | Aggregate-stats extractor (k-anon; no raw rows) → `synthetic_data_stats.json`. |
+| `synthetic_data_generation/build_pools.py` | Offline-first vocabulary-pool builder → `pools/*.json`. |
+| `synthetic_data_generation/generate_synthetic.py` | Synthetic fine-tuning corpus generator (deterministic; see "Synthetic fine-tuning corpus" below). |
+| `synthetic_data_generation/qa_checks.py` | Asserts the spec §12 sanity checks on generated output. |
 
 ## Workflow
 
@@ -32,6 +36,35 @@ Local-fork notes for running [Jantory/anymatch](https://github.com/Jantory/anyma
 5. **Patient inference — two options:**
    - **Colab:** upload pairs CSV to `MyDrive/AnyMatch/alliance/pairs.csv`; the Colab training notebook's Section 5 cell (uses `--serialization_mode mode4` against the mode4 checkpoint) produces `predictions.csv` with `pred` and `match_prob`.
    - **Local Mac:** download `MyDrive/AnyMatch/checkpoints/anymatch_all9_gpt2_mode4/` into `AnyMatch/saved_models/anymatch_all9_gpt2_mode4/`, launch Jupyter / VS Code from the `AnyMatch/` folder, and run `anymatch_synthetic_inference.ipynb` (18 hand-crafted pairs, has ground-truth labels) or `anymatch_alliance_inference.ipynb` (real candidate pairs from blocking). Both notebooks default to the mode4 checkpoint and pass `--serialization_mode mode4`. CPU-only is fine for small batches; full 212k-pair runs should go to Colab GPU.
+
+## Synthetic fine-tuning corpus
+
+A synthetic, AllianceChicago-shaped pair corpus for fine-tuning (and for testing blocking / deterministic rules / Fellegi–Sunter). Design + rationale: `synthetic_data_generation/Synthetic-Dataset-Spec.md`. Everything below runs **locally, offline, no PHI, no GPU** — it works from committed aggregate stats, not raw rows.
+
+1. **(One-time, PHI-local) extract aggregate stats** from the cleaned MDM file:
+   ```sh
+   python synthetic_data_generation/extract_mdm_stats.py \
+       --input /path/to/MDM_Population_cleaned_v1.csv \
+       --output synthetic_data_generation/synthetic_data_stats.json
+   ```
+   Emits aggregates only (k-anon ≥20 top-N, missingness, histograms, within-cluster field agreement, geo-joint, missingness-pattern joint). The JSON is safe to commit; it's already in the repo.
+2. **Build the vocabulary pools** (offline; bootstraps from the stats + curated supplements):
+   ```sh
+   python synthetic_data_generation/build_pools.py
+   ```
+   Writes `synthetic_data_generation/pools/{first_names,last_names,streets,nicknames,initial_expansion}.json`.
+3. **Generate the corpus** (deterministic from `--seed`; ~4 s for the full 40k+10k build):
+   ```sh
+   python synthetic_data_generation/generate_synthetic.py --seed 42 --version 1
+   ```
+   Writes four files to `data/synthetic/` at `v1`: `finetune_train` / `finetune_test` (balanced 1:1.5, case-first, entity-disjoint), `realistic_eval` (1:9, entity-first), `blocking_eval` (record-level, full cleaning schema + `entity_id`). Ground-truth provenance (`entity_id`, `case_type`, `corruptions_applied`, split) is carried inline in these files — no separate manifest files. Use `--smoke` for a quick tiny run.
+4. **Validate**:
+   ```sh
+   python synthetic_data_generation/qa_checks.py --version 1
+   ```
+   Asserts every §12 check. Add `--real-header /path/to/MDM_Population_cleaned_v1.csv` to also assert exact `blocking_eval` schema parity against the real cleaned header.
+
+The fine-tune pair CSVs are drop-in for `loo.py` (model reads `*_l`/`*_r` + `label`; provenance columns are skipped by `df_serializer`). Note: the synthetic schema passes `first_name`/`middle_name`/`last_name` as **three separate fields** (spec §2), which supersedes the single derived `name` the current alliance inference notebook uses — update its `FEATURE_RENAMES` to match before scoring with a fine-tuned checkpoint.
 
 ## Pairs CSV format
 

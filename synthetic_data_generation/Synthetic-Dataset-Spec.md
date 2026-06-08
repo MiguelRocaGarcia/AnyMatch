@@ -1,6 +1,21 @@
 # Synthetic Dataset Spec for AnyMatch Fine-Tuning
 
-**Status:** v0.4 draft — review-pass revisions 2026-05-28: (a) corruption budgets will be **calibrated from real within-cluster field agreement** (new `within_cluster_agreement` stats block, §5.8) instead of hand-guessed; (b) **correlated entity sampling** — geo and missingness sampled as joint blocks, first name conditioned on DOB year (§5.9, §6); (c) **`Phones_set`/`full_name_tokens` emitted sorted** for reproducibility (§3); (d) **NM-SSN-05** added to teach the SSN↔last-4 coupling negatively (§8.2); (e) **name pools now from public reference data** (Census surnames, SSA given-names-by-year), LLM reserved for the two curated tables (§14); (f) realistic-eval / blocking-eval clarified as **deliberately blocking-agnostic** (§9.2). Re-run `extract_mdm_stats.py` to populate the new §5.8/§5.9 [TBD] blocks before building the generator.
+## Generated files at a glance
+
+Running `python synthetic_data_generation/generate_synthetic.py --seed 42 --version 1` writes **four** CSVs to `data/synthetic/` (all `vN`-versioned). The generator first builds a population of synthetic patient *entities* (each a real-world person with a stable `entity_id`), emits one or more records per entity with realistic clerical corruptions (typos, name-token shuffles, missing SSN, address moves, …), and then assembles those records into the files below. All ground-truth provenance (`entity_id`, `case_type`, `corruptions_applied`, `split`) rides **inside** these files — there are no separate manifest files.
+
+| File | Level | Rows (v1) | Match:non-match | Purpose |
+|---|---|---|---|---|
+| `finetune_train_v1.csv` | pair | ~30.9k | ~1:1.5 (balanced) | **Training set** for fine-tuning the mode4 checkpoint. Built **case-first**: deliberately balanced across the hard FQHC scenarios (§8) so the model learns the specific failure modes — SSN as decisive identity, cross-name-field token shuffles, household false-matches. |
+| `finetune_test_v1.csv` | pair | ~9.1k | ~1:1.5 | **Held-out test** for the fine-tune. **Entity-disjoint** from train (§10) — no entity appears in both — so it measures generalization, not memorization. |
+| `realistic_eval_v1.csv` | pair | 10k | 1:9 (realistic) | **Headline evaluation set** at realistic match prevalence. Built **entity-first**: pairs surface the way they would after blocking, with realistic class imbalance, so reported precision/recall reflects production conditions rather than the balanced training ratio. |
+| `blocking_eval_v1.csv` | record | ~16.7k | — | **Record-level** set (one row per record, *not* per pair) carrying the full cleaning-output schema (`_raw` + `_clean` + derived + `valid_record`) plus a ground-truth `entity_id`. Drop-in compatible with `MDM_Population_cleaned_v1.csv` so blocking/candidate-generation code runs unmodified, and the `entity_id` cluster label lets you measure blocking recall/precision. Drawn from the **same entities** as `realistic_eval_v1.csv` (§11.1). |
+
+**Column conventions (pair files).** Model-input columns carry `_l`/`_r` suffixes and mirror the MDM-cleaned schema (consumed by `df_serializer` after `FEATURE_RENAMES`). Provenance columns use other naming so `df_serializer` skips them: `PATID_A`/`PATID_B`, `entity_id_a`/`entity_id_b` (ground-truth cluster ids), `case_type` (e.g. `M-SSN-04`), `corruptions_applied` (JSON list), and `label`. See §11 for the full layout.
+
+---
+
+**Status:** v0.4 draft — review-pass revisions 2026-05-28: (a) corruption budgets will be **calibrated from real within-cluster field agreement** (new `within_cluster_agreement` stats block, §5.8) instead of hand-guessed; (b) **correlated entity sampling** — geo and missingness sampled as joint blocks, first name conditioned on DOB year (§5.9, §6); (c) **`Phones_set`/`full_name_tokens` emitted sorted** for reproducibility (§3); (d) **NM-SSN-05** added to teach the SSN↔last-4 coupling negatively (§8.2); (e) **name pools now from public reference data** (Census surnames, SSA given-names-by-year), LLM reserved for the two curated tables (§14); (f) realistic-eval / blocking-eval clarified as **deliberately blocking-agnostic** (§9.2). **Stats re-run landed 2026-05-28:** §5.8/§5.9 now carry measured numbers, and §7 corruption budgets are recalibrated from them — headline finding is that **name change (~48%) and address move (~70%) are the *norm* in true pairs, while tidy off-by-one DOB corruptions are essentially nonexistent (<0.1%)**; framing of §7 updated accordingly. **Pre-build decisions locked 2026-05-28:** (1) K-per-entity keyed by identifier band (§7); (2) fine-tune corpus built **case-first** to exact per-scenario budgets, realistic-eval + M-MIX built **entity-first** (§9); (3) corruptions applied as **independent per-field Bernoulli at the §5.8 marginals** (§7); (4) per-field calibration bound fixed — name/address/phone/email from `by_ssn`, sex from `by_ssn_dob`, DOB from `by_ssn` (§7); (5) pools sourced from **US Census surnames + SSA names-by-year + Chicago street names** via `build_pools.py` (§14). Spec is build-ready. **Generator built 2026-06-08:** `build_pools.py` (offline-first) + `generate_synthetic.py` + `qa_checks.py` are implemented and verified — full 40k fine-tune + 10k realistic-eval run is ~4 s, byte-reproducible from `--seed`, with all §12 structural checks passing (§14.5, §13).
 
 **Status (v0.3):** §5 filled from `synthetic_data_generation/synthetic_data_stats.json` (n=163,364, k-anon ≥20); core design decisions locked 2026-05-28. Decisions locked this revision: (1) **input schema** — pass the three name fields raw, include `AddressLine2` (§2); (2) **scale** — 40,000-pair fine-tune corpus at 1:1.5 match:non-match + 10,000-pair realistic-eval at 1:9 (§9), with concrete per-scenario budgets; (3) **split** — 15% entity-disjoint hold-out (§10); (4) **generation approach** — code-primary generator with a local LLM (Ollama) seeding static vocabulary pools only (§14); (5) **stakeholder-gated scenarios** excluded by default behind a flag (§8.3). Remaining open items (§13) are stakeholder sign-offs and the build itself (generator + QA notebook), not design or stats gaps.
 
@@ -83,7 +98,7 @@ full_name_tokens, full_name_compact, Phones_set, Address_normalized
 1. **Cleaned-output convention.** Synthetic values follow the conventions in `docs/Data-Cleaning-Guide.md`: uppercase names, ASCII only, standardized USPS suffixes, etc. We do *not* generate dirty inputs and re-clean them; we generate post-cleaned values directly. (Exception: we *do* simulate the few classes of corruption that survive cleaning — e.g., one-digit SSN typos, name-field swaps, DOB transpositions.)
 2. **`valid_record=True` only.** Per `CLAUDE.md`, downstream inference filters to `valid_record=True`. The model never sees invalid records, so we never generate them.
 3. **Entity-first for the bulk.** Sample N synthetic persons (entities) from realistic distributions; per entity produce K record variants by applying transformations; form match pairs within an entity and non-match pairs across entities. This naturally generates realistic mixed-corruption patterns.
-4. **Case-first top-up for edge cases.** Some scenarios (twins, Jr-Sr, junk-SSN last-4 collisions, name-order swaps) are too rare in entity-first sampling to teach the model reliably. We enumerate them explicitly and append.
+4. **Case-first construction for the fine-tune corpus.** The training corpus is built case-first: each §8 scenario is constructed to its exact §9.1 budget (twins, Jr-Sr, junk-SSN last-4 collisions, name-order swaps would be too rare to learn from emergent entity-first sampling). Entity-first is used for the realistic-eval and the M-MIX bulk (§9 assembly mechanism).
 5. **Realistic distributions cited, not invented.** Every distribution choice (name top-N, DOB year mix, missingness rate per field, ZIP/state mix) cites `synthetic_data_stats.json`. Where we deliberately diverge from real (e.g., oversampling SSN-match-everything-else-disagrees), the spec records the deviation explicitly.
 6. **Two-stage output.** §11 — a balanced/oversampled fine-tune corpus *and* a realistic-distribution holdout eval.
 7. **Entity-disjoint split.** No synthetic entity appears in both train and test. Prevents the model from memorizing identities. §10.
@@ -174,26 +189,57 @@ Used to calibrate K records per synthetic entity in §7.
 
 ### 5.8 Within-cluster field agreement (true-positive proxy) — corruption calibration
 
-**[TBD — populate after re-running `extract_mdm_stats.py`]** (extractor extended 2026-05-28; `within_cluster_agreement` block).
+Measured 2026-05-28. Records sharing a key are a same-person proxy; field-agreement rates over within-cluster **record pairs** are the empirical corruption model that drives §7. Two cluster keys matter: **`by_ssn`** (5,696 pairs sharing a full SSN — the primary calibration; but a few are SSN-entry-error pairs, which inflates disagreement) and **`by_ssn_dob`** (4,499 pairs sharing SSN *and* DOB — higher-purity same-person, so a tighter *upper* bound on agreement). `by_last4_dob` (14,340 pairs) is collision-heavy and used for negative calibration, not corruption rates.
 
-§7 corruption budgets (how often a name typo, DOB drift, dropped middle, address move, etc. appears between two records of the *same* person) were previously hand-guessed. We now measure them from real data: records sharing a full `SSN_clean` are a high-purity same-person proxy, so the field-agreement rates over **within-cluster record pairs** are an empirical corruption model. The extractor emits, per cluster key (`by_ssn` highest-purity; `by_ssn_dob`; `by_last4_dob` lower-purity / collision-flavored):
+| Field agreement | `by_ssn` | `by_ssn_dob` | Reading |
+|---|---|---|---|
+| `first_exact` | **82.8%** | 93.9% | First name differs in ~6–17% of same-person pairs. |
+| `last_exact` | **69.3%** | 78.9% | **Last name differs in ~21–31%** — surname change (maiden↔married, dropped second surname) is common, not rare. Validates M-SSN-04. |
+| `compact_exact` | **51.8%** | 59.2% | **Only ~half of same-person pairs share an identical full name.** Name corruption is a *majority* event, not an edge case. |
+| `compact_editdist_le1` | 65.9% | 75.1% | Of the name differences, only ~⅓ are single-char-typo-scale; the rest (edit-dist ≥2) are surname swaps / token changes — *bigger* than typos. |
+| `tokens_set_equal` | **51.4%** | 58.7% | Cross-field token set unchanged ~half the time → token shuffles + real token changes are both large. |
+| middle `both_present_equal` | 83.5% | 83.4% | When both have a middle, it differs ~16%. |
+| middle `exactly_one_missing` | 21.5% | 23.6% | One side has a middle, the other doesn't, ~22% of the time. |
+| DOB `exact` | **86.9%** | 100%* | DOB matches ~87%; *(`by_ssn_dob` is 100% by construction).* |
+| DOB `off_by_one_day`/`year`/`transpose` | **~0.04% each** | — | **The "neat" clerical DOB corruptions are essentially nonexistent in real data.** |
+| DOB `other` (larger diff) | **12.9%** | — | When DOB disagrees, it is almost always a *substantial* difference, not off-by-one. |
+| `line1_exact` | **28.8%** | 33.1% | **Address moves are the norm — only ~29–33% share a street.** |
+| `city_exact` | 86.6% | 88.2% | Most moves stay in-city. |
+| `state_exact` | **99.0%** | 98.8% | Cross-state moves are rare. |
+| `zip_exact` | 47.0% | 52.4% | ZIP differs about half the time (intra-city moves). |
+| `phone_overlap_ge1` | **34.3%** | 39.4% | **Phone overlaps on only ~⅓ of matches** → phone is a weak corroborator, not expected on most true pairs. |
+| `email_exact` | 56.3% | 57.4% | (small denom ~500) Email differs ~43% when both present. |
+| `sex_exact` | **91.5%** | 98.5% | Sex disagrees ~8.5% in `by_ssn` but only ~1.5% once DOB is also pinned → most of that 8.5% is SSN-error pairs; **use ~1.5–2% as the true same-person sex-flip rate.** |
 
-- Name: `first_exact`, `last_exact`, `compact_exact`, `compact_editdist_le1/le2`, `tokens_set_equal` (cross-field token shuffle rate — directly calibrates how often M-NAME-* token moves actually occur).
-- Middle: `both_present_equal`, `exactly_one_missing_rate`.
-- DOB: `exact` / `off_by_one_day` / `off_by_one_year` / `month_day_transpose` / `other` — sets the realistic mix of DOB corruptions.
-- Address: `line1_exact`, `city_exact`, `state_exact`, `zip_exact` (the move rate is `1 − line1_exact`).
-- `phone_overlap_ge1`, `email_exact`, `sex_exact`.
+**Headline implications (these reshape §7 and some §8 weights):**
+1. **Name instability is the dominant real corruption**, not typos. ~48% of same-person pairs have a non-identical full name, mostly from surname change / token movement rather than single-char typos. §7 should corrupt names on a large fraction of match variants, weighted toward surname-change and token-shuffle over typos.
+2. **Off-by-one / transposition DOB corruptions are a teaching device, not a realistic frequency** (<0.1% each). Keep them in the fine-tune corpus for tolerance training but make them rare in the realistic-eval; the realistic DOB-disagreement mode is exact (87%) or a larger "other" gap (13%).
+3. **Address moves dominate** (~70% change street, ~half change ZIP), almost always within state. The matcher cannot lean on address agreement for true pairs.
+4. **Phone overlap (~34%) and email agreement are weak positive signals** — most true pairs do *not* share them.
+5. The `by_last4_dob` name-agreement collapse (`compact_exact` 22.6%, `tokens_set_equal` 22.4%) confirms **last-4 + DOB is heavily collision-prone** (~77% of such pairs are different names) — calibrates NM-SSN-01/02 as genuinely hard and frequent.
 
-All rates are conditional (denominator = pairs where the field is present on both sides) and are aggregate-only (k-anon safe). **§7's per-corruption probabilities are to be set from this block, not invented.**
+All rates are conditional (denominator = pairs where the field is present on both sides) and aggregate-only (k-anon safe).
 
 ### 5.9 Joint distributions for correlated entity sampling
 
-**[TBD — populate after re-running `extract_mdm_stats.py`]** (extractor extended 2026-05-28).
+Measured 2026-05-28.
 
-To fix the field-independence problem in §6 (records that are marginally realistic but jointly implausible), the extractor now emits two joint distributions:
+**`geo_joint`** — 282 `City|State|ZIP3` combos above k-anon (plus a 19,051-record tail). Heavily concentrated: **`CHICAGO|IL|606` is 63.0%** of records; the next tier is `LEXINGTON|KY|405` (3.1%), `CICERO|IL|608`, `BALTIMORE|MD|212`, `EVANSTON|IL|602`, `LOUISVILLE|KY|402`, plus the Hawaii (`…|HI|967`) and Wyoming (`…|WY|820/826`) clusters. §6 draws `(City, State, ZIP3)` as **one** joint sample from this table, which makes ZIP3↔state consistency automatic (§4.12) and prevents implausible geography (a Chicago resident on an 808 area code). The street, full ZIP, and area code are then filled conditional on the drawn geography.
 
-- `geo_joint` — top-N `City|State|ZIP3` combinations (k-anon ≥20). §6 samples geography as one correlated draw instead of three independent marginals (which previously could place a Chicago resident on an 808/Hawaii area code).
-- `missingness_patterns` — top-N joint present/absent patterns over `{ssn_full, ssn_last4, middle, address, email, phone, sex}`. §6 samples a *whole missingness pattern* per entity, so thin transient records correctly miss SSN + address + phone *together* instead of nulling each field independently.
+**`missingness_patterns`** — 51 joint present/absent patterns above k-anon over `{ssn_full, ssn_last4, middle, address, email, phone, sex}` (only 204 records in the tail). §6 draws a **whole pattern** per entity, so co-missingness is realistic. The shape is dominated by no-SSN records:
+
+| Pattern (ssn_full,ssn_last4,middle,address,email,phone,sex) | Count | Share | Meaning |
+|---|---|---|---|
+| `0001011` | 48,524 | **29.7%** | No SSN/last-4/middle/email; has address + phone + sex. **The canonical FQHC record.** |
+| `0001111` | 18,802 | 11.5% | …same, plus email. |
+| `0001010` | 12,424 | 7.6% | No SSN/last-4/middle/email/sex; has address + phone. |
+| `1101011` | 10,863 | 6.6% | Full SSN + last-4, no middle, address + phone + sex (no email). |
+| `0011011` | 8,490 | 5.2% | Last-4 only (no full SSN), address + phone + sex. |
+| `0101111` | 7,929 | 4.9% | Last-4 only, with middle + email. |
+| `1111111` | 4,520 | 2.8% | Everything present. |
+| `0000000` | 1,008 | 0.6% | Everything missing (still `valid_record=True` on name+DOB). |
+
+(Full 51-row table in `synthetic_data_stats.json`.) Sampling these jointly reproduces the §5.1 marginals automatically and is the single source of truth for field presence (§6).
 
 ### 5.10 Statistics we still do **not** have
 
@@ -215,7 +261,7 @@ A synthetic *entity* represents a single ground-truth person. For each entity:
 1. **Sex:** *presence per the missingness pattern.* When present, value sampled from `categorical_top.SexAtBirthDSC_clean` — among present: F **55.5%**, M **44.2%**, OTHER **0.3%**. (Marginal present-rate ≈ 0.791; validated, not re-drawn.)
 2. **DOB:** sample year from `dob.decade_histogram` (weights: 1940s 2.4%, 1950s 7.2%, 1960s 11.2%, 1970s 13.3%, 1980s 18.2%, 1990s 19.7%, 2000s 14.5%, 2010s 10.0%, 2020s 2.4%, pre-1940 <1%). Month uniform 1–12; day uniform 1–28 initially (lift to true day-of-month distribution once date arithmetic is verified). DOB is effectively always present (99.7%); not part of the missingness-pattern set, so the rare null is drawn here with probability **0.003**.
 3. **Names:**
-    - Sample first/last from the measured top-N pools weighted by their counts; for the long tail (`below_threshold_total`) draw from the public reference pools (§14.4: Census surnames, SSA given names). **First name is drawn conditioned on the entity's DOB year** (SSA-by-year), so the name is age-appropriate (a 2020s record gets a 2020s-popular name).
+    - Sample first/last from the measured top-N pools weighted by their counts; for the long tail (`below_threshold_total`) draw from the public reference pools (§14.4: Census surnames, SSA given names). **First name is intended to be drawn conditioned on the entity's DOB year** (SSA-by-year), so the name is age-appropriate (a 2020s record gets a 2020s-popular name). *(Build status: DOB-conditioning is **deferred** in v1 — the offline pool build leaves `by_year` empty, so the generator falls back to the flat measured first-name distribution, which already reflects this population's real age mix. Enable via the optional SSA network enrichment in `build_pools.py`; see §14.4.)*
     - `p_compound_first = 0.02` (probability of 2-token first name, e.g. `MARIA CARMEN`).
     - `p_two_surname = 0.07` (probability of 2-token last name; Hispanic paternal+maternal convention). When triggered, set last = `<paternal> <maternal>` drawn jointly from top last-name pool.
     - `p_hyphen_last = 0.018` (independent of compound).
@@ -226,16 +272,47 @@ A synthetic *entity* represents a single ground-truth person. For each entity:
     - **Last-4-only:** generate `last_4_SSN` only (full null). Last-4 must obey "not `0000`".
     - **None:** both null.
 6. **Address:** *presence per the missingness pattern; the `(city, state, ZIP3)` triple comes from the geography draw above (`geo_joint`), not a separate sample here.* When present, generate `AddressLine1_clean` as `<NNN[N[N]]> <STREET-NAME> <SUFFIX>` where suffix is sampled from {AVE: 0.45, ST: 0.22, RD: 0.07, DR: 0.06, PL: 0.04, CT: 0.025, BLVD: 0.024, LN: 0.019, …} (re-normalized from §5.4). `p_apt = 0.294` and `p_po_box = 0.021` are *sub-structure given an address is present*; when apt set, prefix uniform from {APT: 0.64, UNIT: 0.05, BSMT: 0.03, FL: 0.03, 1ST/2ND/3RD: 0.05, …}. (Marginal address present-rate ≈ 0.976, validated.)
-7. **Phones:** *presence per the missingness pattern* (the pattern's `phone` bit = the histogram's 0-bucket, 5.6%). When present, draw the **count** N ∈ {1,2,3,4} from the histogram `{1:0.124, 2:0.556, 3:0.252, 4:0.012}` *renormalized to exclude 0*. Each phone has an area code drawn from the measured primary area-code distribution (773/312/708/859/808/872/224/847/307/630/502/…); NXX and line generated to NANP-valid form (NXX ∈ 200–999, no `N11`). The first phone fills `PrimaryPhoneNBR_clean`, then `Phone01..03NBR_clean` in order.
+7. **Phones:** *presence per the missingness pattern* (the pattern's `phone` bit = the histogram's 0-bucket, 5.6%). When present, draw the **count** N ∈ {1,2,3,4} from the histogram `{1:0.124, 2:0.556, 3:0.252, 4:0.012}` *renormalized to exclude 0*. Each phone's area code is drawn **consistent with the entity's geography** (§5.9) where the mapping is unambiguous — Chicago → {773,312,872,224,847,708,630,815,…}, Lexington KY → 859, Hawaii → 808, Wyoming → 307, Louisville → 502, Baltimore → {410,443}, NY → {646,347,607,…} — falling back to the global measured primary area-code distribution otherwise. NXX and line generated to NANP-valid form (NXX ∈ 200–999, no `N11`). The first phone fills `PrimaryPhoneNBR_clean`, then `Phone01..03NBR_clean` in order.
 8. **Email:** *presence per the missingness pattern* (marginal ≈ 0.311, not re-drawn). When present, domain sampled from `{gmail.com: 0.66, yahoo.com: 0.18, hotmail.com: 0.045, icloud.com: 0.033, aol.com: 0.009, outlook.com: 0.006, …}`; local part derived from name with a configurable corruption.
 
-Each entity gets a stable `entity_id` (UUIDv4); each emitted record gets a fresh `PATID` solely for bookkeeping / cross-referencing the pair and entity manifests. `PATID` is never serialized into the model prompt (§3, §11).
+Each entity gets a stable `entity_id` (deterministic `E%09d` counter); each emitted record gets a fresh `PATID` solely for bookkeeping / cross-referencing rows by their `entity_id` provenance columns. `PATID` is never serialized into the model prompt (§3, §11).
 
 ## 7. Variant (record) generation per entity
 
-For each entity, decide K (number of records to emit) from the SSN-cluster-size histogram. Most entities get K=1; the upper tail gets K∈{2..6}.
+**K (records per entity), keyed by identifier type (locked 2026-05-28).** The realistic cluster-size distribution depends on what identifier the entity carries, so K is drawn from the matching measured histogram in §5.7 — *not* the SSN histogram for everyone (64% of entities have no SSN and would otherwise all be forced to K=1):
 
-For each pair of variants drawn from the same entity, apply 0..M corruptions. The corruption pool maps directly to the scenario catalog (§8). A *corruption budget* per pair is sampled — most pairs get 1–2 corruptions, a long tail gets more (the synthetic analog of "this record is a mess").
+| Entity identifier band | K histogram source (§5.7) | Singleton / 2 / 3 / 4+ |
+|---|---|---|
+| Full SSN | `clusters.by_ssn` | 87.4% / 11.1% / 1.3% / 0.2% |
+| Last-4 only | `clusters.by_last4_dob` | 81.6% / 14.3% / 3.1% / 0.95% |
+| No SSN at all | `clusters.by_namecompact_dob` | 83.8% / 13.0% / 2.5% / 0.6% |
+
+This is the **realistic-eval / entity-first** K distribution. The **fine-tune corpus** is built case-first (§9.1), so there K is whatever the scenario recipe needs (≥2 for any match scenario); the realistic singleton majority only governs the realistic-eval and the entity-first M-MIX bulk. Singletons (K=1) contribute only non-match pairs.
+
+For each pair of variants drawn from the same entity, apply corruptions. The corruption pool maps directly to the scenario catalog (§8).
+
+**Calibrated corruption rates (from §5.8 `by_ssn` / `by_ssn_dob`).** The earlier "most pairs get 1–2 corruptions" assumption was wrong: in real same-person pairs, **corruption is the norm**. The per-field *differ* rates below are the targets the entity-first match population must reproduce (so the realistic-eval looks like reality); `by_ssn` is the working target, with `by_ssn_dob` as the lower-disagreement bound:
+
+| Field | P(differs) target | Notes for the corruptor |
+|---|---|---|
+| Full name (compact) | **~0.45** (0.41–0.48) | The headline: name changes on ~half of true pairs. Compose from the field-level rates below. |
+| Last name | **~0.28** (0.21–0.31) | Dominant single source — weight surname-change (maiden↔married, drop one of two surnames) heavily, not just typos. |
+| First name | ~0.12 (0.06–0.17) | |
+| Name-change *type*, given a change | ~⅓ typo-scale (edit ≤1), ~⅔ larger (surname swap / token move) | Don't make every name diff a single-char typo. |
+| Middle (both present) | ~0.16 differ | |
+| Middle one-side-missing | ~0.22 of all pairs | Drop-middle / add-middle is frequent. |
+| DOB | **~0.13** differ, of which **off-by-one/transpose ≈ 0.001**, rest a larger "other" gap | Off-by-one & month-day-transpose are kept for *teaching tolerance* but must be **rare** in the realistic-eval; the realistic DOB-disagreement is a bigger jump. |
+| Address line1 (move) | **~0.70** (0.67–0.71) | Address moves are the default; ~half also change ZIP, ~13% change city, **~1% change state**. |
+| Phone (no overlap) | **~0.65** | Overlap on only ~⅓ of true pairs — phone is a weak corroborator. |
+| Email (both present) | ~0.43 differ | |
+| Sex flip | **~0.015–0.02** | Use the `by_ssn_dob` 1.5% (the `by_ssn` 8.5% is mostly SSN-error pairs, not true sex flips). |
+
+**Which bound per field (locked 2026-05-28).** `by_ssn` and `by_ssn_dob` disagree because `by_ssn` includes a slice of SSN-entry-error pairs (different people, same typed SSN). The rule:
+- **Name (first/last/compact/tokens), address, phone, email → use `by_ssn`** (the higher-drift figures). In entity resolution, *recall* matters — we want the model to tolerate the full range of same-person drift, and `by_ssn_dob` understates it by conditioning on a clean DOB match.
+- **Sex → use `by_ssn_dob` (~1.5%).** The `by_ssn` 8.5% is almost entirely the SSN-error artifact, not genuine same-person sex flips.
+- **DOB → use `by_ssn` (~13% differ).** `by_ssn_dob` is 100%-exact by construction and unusable here; within that 13%, off-by-one/transpose stay at their measured <0.1% (teaching-only, see §8 DOB note).
+
+**Corruption application model (locked 2026-05-28): independent per-field Bernoulli at the calibrated marginals.** Each field is corrupted independently at its P(differs) target above. We deliberately do **not** synthesize a field-to-field corruption *correlation*, because we have no measured joint-corruption distribution to calibrate one against and inventing it would distort the validated marginals (§12.7). Real "everything is a mess" co-occurrence is instead supplied explicitly by the heavy-drift scenarios (M-MIX-02, M-SSN-11) so the tail is represented without biasing the bulk. If QA later shows the realistic-eval is under-dispersed (too few multi-field-corrupted pairs), add a mild shared "messiness" multiplier as a v2 knob. SSN/last-4 are stable within a true cluster by construction (they're the cluster key), so SSN is never corrupted in match pairs except in the explicit M-SSN-08 / M-L4-03 drift scenarios.
 
 Corruption types (see §8 for the scenarios that combine these):
 - **Name corruptions:**
@@ -336,6 +413,8 @@ This bucket targets the 14.3% backup-only band where neither side has a full SSN
 - **M-NAME-13 — Diacritical loss (already cleaned).** Pre-cleaning, side A was `MUÑOZ` and B was `MUNOZ`; both post-clean to `MUNOZ`. Included as a control: should appear identical at our level. (Tests our cleaning fidelity, not the model.)
 
 #### DOB-led
+
+> **Calibration note (§5.8):** in real same-person pairs DOB matches exactly ~87% of the time, and when it differs it is almost always a *substantial* gap, not a tidy off-by-one (off-by-one-day/year and month-day-transpose are each <0.1%). M-DOB-02/03/04 below are therefore **teaching devices for tolerance**, not realistic frequencies — oversample them in the fine-tune corpus but keep them near their true (tiny) rate in the realistic-eval.
 
 - **M-DOB-01 — Identical DOB, otherwise typical.** Control.
 - **M-DOB-02 — Month-day transposition.** `1985-01-15 ↔ 1985-10-15` (only valid when day ≤ 12). Same SSN/name.
@@ -443,7 +522,13 @@ These are scenarios where the *correct* label is ambiguous or depends on the ope
 
 ## 9. Pair assembly
 
-Two-stage build, sharing the same entity / variant generator.
+Two-stage build, sharing the same entity sampler (§6) and corruption pool (§7) but assembling pairs two different ways:
+
+**Assembly mechanism (locked 2026-05-28).**
+- **Fine-tune corpus → case-first (constructive).** Each §8 scenario has a recipe and a §9.1 quota; we construct exactly that many pairs by sampling the entity (or two entities), applying the scenario's *defining* transformation deterministically, then drawing the remaining fields' corruptions from the §7 marginals. Labels and `case_type` are known by construction (no fuzzy "dominant scenario" inference), and every ER-relevant case is guaranteed present at its budgeted count. This is why the fine-tune corpus ignores the realistic singleton-heavy K distribution — it builds the pairs it needs.
+- **Realistic-eval + the M-MIX bulk → entity-first (emergent).** Sample entities at realistic K / missingness / geo (§6, §7), apply §7-calibrated corruptions, form within-entity match pairs and cross-entity non-match pairs, and tag the nearest `case_type` post-hoc (best-effort, analysis-only). This reproduces the natural mixed-corruption distribution the realistic-eval needs.
+
+Both modes are deterministic from `--seed` and share the 15% entity hold-out (§10).
 
 ### 9.1 Fine-tune corpus (balanced / oversampled)
 
@@ -476,8 +561,8 @@ Goal: each scenario above has enough examples for the model to internalize it.
 
 Hard negatives (household + common-name + SSN + identity-fragment = 77% of the NM budget) carry the bulk because they are the precise failure modes of an SSN-trumping model. Easy negatives stay substantial to anchor the "obviously different = 0" baseline. Per-scenario counts that exclude flag-gated scenarios (§8.3) are redistributed within their bucket.
 
-- Within entity-first generation, run match-pair construction; tag each emitted pair with the dominant scenario triggered.
-- Top-up: for scenarios whose entity-first counts fall below target, run a case-first generator that constructs pairs deterministically against the spec.
+- **Case-first construction** fills each scenario's quota above directly and deterministically (see §9 assembly mechanism). Flag-gated scenarios (§8.3) contribute 0 unless enabled; their freed budget is redistributed within their bucket.
+- A minority slice of the M-MIX budget is drawn entity-first so the corpus also contains naturally-co-occurring multi-field corruption, not only single-scenario-constructed pairs.
 
 ### 9.2 Realistic-eval set
 
@@ -487,8 +572,8 @@ Goal: measure model performance as it will be observed in production.
 
 **Blocking-agnostic by design (clarified 2026-05-28).** This set — and the record-level `blocking_eval_v1.csv` it shares entities with (§11.1) — is **not** conditioned on, or pre-filtered by, any blocking key. Its distribution reflects the natural population (drawn from `synthetic_data_stats.json`), not the output of a particular blocker. That is deliberate: the blocking strategy, deterministic rules, and Fellegi–Sunter models are *downstream consumers we want to evaluate against this set independently*. Conditioning the eval on a blocking key would make it impossible to measure that blocker's own recall/precision (you can't score a filter on data it already filtered). So prevalence and negative-hardness here come from the population shape, not from assumptions about what survives blocking.
 
-- Sample from the *same* entity / variant generator, with prevalence drawn from `synthetic_data_stats.json` (not the balanced §9.1 weights).
-- Each scenario tagged; per-scenario metrics reported separately (so we see if SSN-trumping works on the realistic mix even if it's rare).
+- Built **entity-first** (§9 assembly mechanism) at the realistic K / missingness / geo distributions, with prevalence drawn from `synthetic_data_stats.json` (not the balanced §9.1 weights).
+- Each pair tagged with its nearest `case_type`; per-scenario metrics reported separately (so we see if SSN-trumping works on the realistic mix even if it's rare).
 
 ## 10. Train / test split
 
@@ -505,9 +590,9 @@ data/synthetic/finetune_train_v1.csv     # balanced corpus, train side of entity
 data/synthetic/finetune_test_v1.csv      # balanced corpus, test side                     (pair-level)
 data/synthetic/realistic_eval_v1.csv     # held-out realistic distribution                (pair-level)
 data/synthetic/blocking_eval_v1.csv      # realistic-distribution RECORDS (not pairs)     (record-level)
-data/synthetic/entity_manifest_v1.csv    # per-entity ground truth + which split it landed in
-data/synthetic/pair_manifest_v1.csv      # per-pair provenance: case_type, corruptions_applied
 ```
+
+Per-pair provenance (`case_type`, `corruptions_applied`, `entity_id_a/_b`) and per-entity ground truth (`entity_id`, `split`) ride **inside** the pair / record CSVs themselves (see the column layouts below), so no separate manifest files are emitted.
 
 ### 11.1 Record-level blocking-eval file (`blocking_eval_v1.csv`)
 
@@ -540,7 +625,7 @@ valid_record,
 entity_id
 ```
 
-**How we satisfy the `_raw` columns.** §3 normally skips `_raw` because synthesis has no upstream noise to preserve. For this file we **populate `_raw` by copying the corresponding `_clean` value** (and `ZipCD_raw` from the recombined `ZipCD_clean_base`[+`-ext`], `BirthDT_raw` from `BirthDT_clean`, etc.). This is a faithful stand-in: a record whose raw value was already clean. Blocking keys are built from `_clean`/derived fields anyway, so the synthetic `_raw` content does not bias blocking — it exists purely for column-schema parity. `CountryNM` is filled with the modal real value (`USA`/blank per stats); `valid_record` is always `True` (§4 principle 2).
+**How we satisfy the `_raw` columns.** §3 normally skips `_raw` because synthesis has no upstream noise to preserve. For this file we **populate `_raw` by copying the corresponding `_clean` value** (and `ZipCD_raw` from the recombined `ZipCD_clean_base`[+`-ext`], `BirthDT_raw` from `BirthDT_clean`, etc.). This is a faithful stand-in: a record whose raw value was already clean. Blocking keys are built from `_clean`/derived fields anyway, so the synthetic `_raw` content does not bias blocking — it exists purely for column-schema parity. `CountryNM` is filled with the modal real value (`US` — 58.9%; real data also carries `UNITED STATES` 26.8% and a literal `1` 13.2%, so a faithful fill samples from those three); `valid_record` is always `True` (§4 principle 2).
 
 **Relationship to `realistic_eval_v1.csv`.** Both are drawn from the **same entity/variant generator at the same realistic prevalence and share the same 15% entity hold-out** (§10). `blocking_eval_v1.csv` is the *record-level view* of those same entities; the `entity_id` column is the ground-truth cluster label. So you can: (a) run blocking on `blocking_eval_v1.csv` → candidate pairs, (b) score blocking recall/precision by checking each candidate pair's two `entity_id`s, and (c) feed surviving candidates into the matcher for an end-to-end blocking-+-matching evaluation that lines up with the pair-level `realistic_eval_v1.csv`. Scale: same record population that backs the 10k-pair realistic-eval (§9.2).
 
@@ -578,10 +663,11 @@ Address_normalized_l, Address_normalized_r,   # derived; kept for QA
 # Label + provenance (no _l/_r — not consumed by df_serializer)
 label,
 case_type,                # e.g. "M-SSN-04"
-corruptions_applied       # e.g. ["last_name_replace","address_move"]
+corruptions_applied,      # JSON list, e.g. ["replace_last","address_move"]
+entity_id_a, entity_id_b  # ground-truth cluster ids (§4 principle 9); drive the §10 split
 ```
 
-**Deliberately omitted from the pair CSV:** `PATID_l/_r` (would enter prompt as `patid: <UUID>`), `valid_record_l/_r` (always True by §4 principle 2; pure waste of tokens), `ZipCD_clean_ext_l/_r` (93.9% null per §5.1; excluded from §2 model schema). `case_type` and `corruptions_applied` are dropped before passing to `loo.py` / `predict_alliance.py` (the model reads only `*_l`, `*_r`, `label`).
+**Deliberately omitted from the pair CSV:** `PATID_l/_r` (would enter prompt as `patid: <UUID>`), `valid_record_l/_r` (always True by §4 principle 2; pure waste of tokens), `ZipCD_clean_ext_l/_r` (93.9% null per §5.1; excluded from §2 model schema). `case_type`, `corruptions_applied`, and `entity_id_a/_b` are dropped before passing to `loo.py` / `predict_alliance.py` — the model reads only `*_l`, `*_r`, `label`. (`entity_id_a/_b` end in `_a`/`_b`, not `_l`/`_r`, so `df_serializer` skips them even if left in.) `corruptions_applied` is emitted as a JSON-encoded string for clean CSV round-tripping.
 
 ## 12. Sanity checks (run after generation)
 
@@ -643,20 +729,34 @@ Assertions the generator must satisfy and a notebook verifies:
 - [x] **Stakeholder-gated scenarios** routed behind `--include-policy-cases` (§8.3): M-NOSSN-06 / M-SEX-01 excluded by default; POL-AMBIG-01 always excluded; POL-AMBIG-02/03 included-but-tagged.
 
 **Resolved by review pass (2026-05-28, v0.4):**
-- [x] **Calibrate corruption budgets from real data.** Extended `extract_mdm_stats.py` with `within_cluster_agreement` (true-positive proxy over SSN clusters), `geo_joint`, and `missingness_patterns`. §5.8/§5.9 are [TBD] until the script is re-run; §7 budgets to be set from §5.8, not invented.
+- [x] **Calibrate corruption budgets from real data.** Extended `extract_mdm_stats.py` with `within_cluster_agreement` (true-positive proxy over SSN clusters), `geo_joint`, and `missingness_patterns`. Script re-run 2026-05-28; §5.8/§5.9 filled and §7 recalibrated from §5.8.
 - [x] **Correlated entity sampling** (§6): geo as a joint `(City,State,ZIP3)` draw, missingness as a joint pattern draw, first name conditioned on DOB year, pediatric identifier coupling.
 - [x] **Deterministic set serialization** (§3): `Phones_set` / `full_name_tokens` emitted sorted.
 - [x] **NM-SSN-05** added (§8.2): full SSN vs mismatching last-4 ⇒ non-match (negative side of the SSN↔last-4 coupling).
 - [x] **Name pools from public reference data** (§14): Census surnames + SSA given-names-by-birth-year; LLM reserved for nickname / initial-expansion tables.
 - [x] **Realistic-eval / blocking-eval are blocking-agnostic by design** (§9.2) so blocking, deterministic rules, and Fellegi–Sunter models can be evaluated against them independently.
 
-**Still open (stakeholder sign-off + build):**
-- [ ] **Re-run `extract_mdm_stats.py`** (PHI-local) and commit the updated `synthetic_data_stats.json`; fill §5.8 / §5.9 from the new blocks.
-- [ ] Stakeholder confirmation of the §8.3 default-exclude policy (M-NOSSN-06, M-SEX-01, POL-AMBIG-*). Defaults stand until they say otherwise; no build blocker.
-- [ ] Acquire the public name pools (Census surname file, SSA given-names-by-year) and build `pools/`.
-- [ ] Build the generator (`synthetic_data_generation/generate_synthetic.py`) per §14 — next work item.
-- [ ] Build `synthetic_data_generation/llm_pools.py` (Ollama wrapper for the two curated tables) per §14.3 — optional; pools can be hand-authored.
-- [ ] Build the sanity-check notebook (`synthetic_data_generation/synthetic_dataset_qa.ipynb`) — should assert every check in §12.
+**Resolved by stats re-run (2026-05-28):**
+- [x] **Re-ran `extract_mdm_stats.py`**; `synthetic_data_stats.json` updated. Filled §5.8 (within-cluster agreement) and §5.9 (geo_joint + missingness_patterns) with measured numbers; recalibrated §7 corruption rates and added the §8 DOB-led calibration note.
+
+**Resolved by pre-build decisions (2026-05-28):**
+- [x] **K-per-entity** keyed by identifier band (full-SSN→`by_ssn`, last-4→`by_last4_dob`, no-SSN→`by_namecompact_dob`) so no-SSN entities aren't all singletons (§7).
+- [x] **Assembly mechanism**: fine-tune corpus is **case-first** to exact §9.1 budgets (clean labels, guaranteed coverage); realistic-eval + M-MIX bulk are **entity-first** at realistic distributions (§9).
+- [x] **Corruption application**: independent per-field Bernoulli at the §5.8 marginals; no invented field-correlation; heavy co-corruption supplied by M-MIX-02 / M-SSN-11; messiness multiplier deferred to v2 (§7).
+- [x] **Per-field calibration bound**: name/address/phone/email→`by_ssn`; sex→`by_ssn_dob`; DOB→`by_ssn` (§7).
+- [x] **Pool sources** locked + `build_pools.py` step: US Census surnames, SSA names-by-year, Chicago street names (§14.4).
+
+**Resolved by build (2026-06-08):**
+- [x] **`build_pools.py`** built (offline-first; bootstraps pools from stats + curated supplements) and `pools/*.json` generated.
+- [x] **`generate_synthetic.py`** built and verified: entity sampler with correlated geo/missingness/pediatric coupling (§6); independent-marginal corruptions calibrated from §5.8 (§7); full case-first scenario registry covering all §8 buckets (80 distinct `case_type`s fire); entity-first realistic-eval at 1:9; entity-disjoint 15% split; all four §11 outputs (provenance carried inline; no separate manifest files). Full 40k+10k run is ~4 s and **byte-reproducible from `--seed`** (verified via md5 across runs).
+- [x] **`qa_checks.py`** built — asserts every §12 structural check (schema parity, value conventions, valid_record, label/case agreement, entity disjointness, ZIP3↔state, SSN structural + last-4 coupling, NANP phones, no filtered tokens, M-NAME derivation invariance) plus the §12.7 distribution-sanity warnings; **all structural checks pass** on the v1 output.
+
+**Still open:**
+- [ ] Stakeholder confirmation of the §8.3 default-exclude policy (M-NOSSN-06, M-SEX-01, POL-AMBIG-*). Defaults stand until they say otherwise; the `--include-policy-cases` flag is specced but not yet wired into `generate_synthetic.py`.
+- [ ] *(optional)* Network enrichment in `build_pools.py` (Census/SSA/Chicago) for long-tail name diversity + true first-name DOB-conditioning (§6 step 3 currently falls back to the flat measured distribution).
+- [ ] *(optional)* `llm_pools.py` (Ollama wrapper) — pools are hand-authored, so not required.
+- [ ] *(optional)* Wrap `qa_checks.py` in `synthetic_dataset_qa.ipynb` if a notebook view is wanted.
+- [ ] Finer `case_type` tagging for the entity-first realistic-eval (currently coarse: `M-REALISTIC` / `NM-COMMON` / `NM-EASY`).
 - [ ] Decide which scenarios (if any) belong to a "test-only" case bucket.
 
 ## 14. Generation implementation (code + local LLM)
@@ -684,9 +784,9 @@ The LLM never sees real data and never touches per-pair construction, so it cann
 0. `ensure_pools()` — Ollama runs **only if** `pools/*.json` are missing or `--regenerate-pools` is passed; output is validated, deduped, normalized, then written to disk (committed).
 1. Sample entities (§6).
 2. Corrupt → variants (§7).
-3. Assemble pairs to the §9 budget (entity-first + case-first top-up).
+3. Assemble pairs (§9): fine-tune corpus case-first to the §9.1 budgets; realistic-eval + M-MIX bulk entity-first.
 4. Entity-disjoint split (§10).
-5. Write CSVs + manifests (§11).
+5. Write CSVs (§11) — provenance carried inline in the pair / record files.
 
 "Run it all at once" holds: the first invocation does everything end-to-end. Reproducibility also holds: once pools are cached + committed, every later run with the same `--seed` is byte-identical — no LLM nondeterminism enters the per-pair stage. **The `--seed` governs sampling; the committed pool files govern vocabulary.** A teammate or CI without Ollama can regenerate the corpus because the pools are committed.
 
@@ -700,30 +800,44 @@ The LLM never sees real data and never touches per-pair construction, so it cann
 
 ### 14.4 Pools (validated, committed)
 
+**Sources locked 2026-05-28.** A `build_pools.py` helper fetches/normalizes the public files into `pools/*.json` (run once; outputs committed so the generator and CI need no network).
+
 **From public reference data (not the LLM):**
-- `pools/last_names.json` — US Census surname frequency file, reweighted toward the measured `LastNM_clean` top-N; full Census tail used for diversity.
-- `pools/first_names.json` — SSA given-names-by-birth-year, keyed by year so §6 can draw age-appropriate names; reweighted toward the measured `FirstNM_clean` top-N.
-- `pools/streets.json` — street-name list (public OSM/Census TIGER street names, or a curated ~500–2k list); `AddressLine1` numbers + USPS suffix are generated procedurally per §6.6.
+- `pools/last_names.json` — **US Census Bureau "Frequently Occurring Surnames from the 2010 Census"** (`Names_2010Census.csv`, ~162k surnames with counts; public domain). Reweight the head toward the measured `LastNM_clean` top-N (Hispanic/Chicago character); keep the Census tail for diversity.
+- `pools/first_names.json` — **SSA "National data on the relative frequency of given names"** (`names.zip` → `yobYYYY.txt` per birth year; public domain). Stored keyed by birth year so §6 draws age-appropriate names; head reweighted toward the measured `FirstNM_clean` top-N.
+- `pools/streets.json` — **City of Chicago street names** (Chicago Data Portal / Census TIGER ROADS for Cook + the other resident counties; public). ~1–2k street stems; `AddressLine1` house numbers + USPS suffix are generated procedurally per §6 step 6 using the measured suffix distribution (§5.4).
 
 **LLM-seeded, then hand-verified (correctness > diversity; small tables):**
 - `pools/nicknames.json` — bidirectional nickname map (M-NAME-09); weight the Spanish pairs given the population.
 - `pools/initial_expansion.json` — initial↔full-name table for the §7 expand-initial corruption.
 
-The LLM (§14.3) is now optional: it is only invoked to seed the two curated tables, and even those can be hand-authored. If a teammate has no Ollama, the committed pools cover everything; `--regenerate-pools` only re-seeds the nickname/initial tables.
+The LLM (§14.3) is optional: it only seeds the two curated tables, and even those can be hand-authored.
+
+**Build status (implemented 2026-06-08): `build_pools.py` is offline-first.** Rather than depend on network at build time, it bootstraps every pool from two always-available, k-anon-safe inputs and the curated supplements above:
+- name/last-name/street pools are seeded from the measured top-N in `synthetic_data_stats.json` (so synthetic names track the *real* AllianceChicago population directly — more faithful to this dataset than a national list) plus curated long-tail supplements weighted to the population's Hispanic/Chicago character;
+- the nickname and initial-expansion tables are authored verbatim in `build_pools.py` (no LLM needed for v1).
+
+This makes the whole pipeline reproducible with no network and no Ollama. **First-name DOB-conditioning (§6 step 3) is deferred:** the offline build leaves `by_year` empty and the generator falls back to the flat measured first-name distribution, which already reflects this population's real age mix. Optional network enrichment (Census 2010 surnames / SSA names-by-year / Chicago street file) can be layered behind a flag later to add long-tail diversity and enable true DOB-conditioning.
 
 ### 14.5 File layout
 
 ```
 synthetic_data_generation/
-  pools/                       # validated, committed
-    first_names.json           # SSA given-names-by-birth-year (public)
-    last_names.json            # US Census surname frequencies (public)
-    streets.json               # public street-name list
-    nicknames.json             # LLM-seeded + hand-verified
-    initial_expansion.json     # LLM-seeded + hand-verified
-  llm_pools.py                 # Ollama wrapper for the two curated tables (optional; stage 0)
-  generate_synthetic.py        # procedural stages 1-5 + stage-0 orchestration
-  synthetic_dataset_qa.ipynb   # asserts every §12 check
+  pools/                       # committed; built by build_pools.py
+    first_names.json           # measured top-N + curated tail (by_year empty offline)
+    last_names.json            # measured top-N + curated tail
+    streets.json               # measured street stems + curated Chicago streets
+    nicknames.json             # authored in build_pools.py + hand-verified
+    initial_expansion.json     # authored in build_pools.py + hand-verified
+  build_pools.py               # offline-first pool builder (bootstraps from stats); run once
+  generate_synthetic.py        # IMPLEMENTED — entity sampler, corruptions, case-first
+                               #   scenario registry (§8), entity-first realistic-eval,
+                               #   entity-disjoint split, all §11 outputs (provenance inline)
+  qa_checks.py                 # IMPLEMENTED — asserts every §12 check (importable by a notebook)
+  llm_pools.py                 # OPTIONAL / not built — Ollama wrapper for curated tables
 ```
+
+**Generator CLI.** `python synthetic_data_generation/generate_synthetic.py --seed 42 --version 1`
+(full: 40k fine-tune at 1:1.5 + 10k realistic-eval at 1:9 + record-level blocking-eval, ~4 s, byte-reproducible from `--seed`). `--smoke` runs a tiny version for testing. Validate with `python synthetic_data_generation/qa_checks.py --version 1` (add `--real-header <path>` where the real cleaned CSV is available to assert exact blocking-eval schema parity).
 
 Note: §13 / earlier drafts referenced `scripts/generate_synthetic.py`; the file lives in `synthetic_data_generation/` to sit beside its pools and stats.
