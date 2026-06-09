@@ -12,14 +12,15 @@ A **patched fork** of [Jantory/anymatch](https://github.com/Jantory/anymatch) (Z
 
 1. **Data prep** (local): `data/preprocess.ipynb` consumes `data/raw/` → produces `data/prepared/<dataset>/{train,valid,test}.csv` + `attr_*.csv`.
 2. **Train** (Colab Pro A100): `anymatch_training.ipynb` runs `loo.py --leaved_dataset_name none` on all 9 datasets; ~30–60 min; checkpoint backed up to Drive at `MyDrive/AnyMatch/checkpoints/anymatch_all9_gpt2_mode4/`. (The previous `anymatch_all9_gpt2/` mode1 checkpoint is kept around for A/B comparison.)
-3. **Sanity-check inference** (local): `anymatch_synthetic_inference.ipynb` runs `predict_alliance.py` on `data/synthetic/alliance_pairs_synthetic.csv` (18 hand-crafted patient pairs).
-4. **Real inference** (local for small batches, Colab for full 212k): `anymatch_alliance_inference.ipynb` joins the blocking output `data/alliance/candidate_pairs_*.parquet` with `data/alliance/MDM_Population_cleaned_v1.csv`, filters `valid_record=True`, and scores via `predict_alliance.py`.
+3. **Fine-tune** (Colab Pro A100): `anymatch_finetuning.ipynb` runs `finetune_alliance.py`, which **resumes from** the all9 mode4 checkpoint and continues training on the synthetic corpus (`data/synthetic/finetune_{train,test}_v1.csv`); ~10–25 min; checkpoint backed up to Drive at `MyDrive/AnyMatch/checkpoints/anymatch_alliance_ft_v1/`. This is the *sequential* (not joint-mix) fine-tune — gentle LR + early stop on the entity-disjoint test.
+4. **Sanity-check inference** (local): `anymatch_synthetic_inference.ipynb` renames the generated `data/synthetic/realistic_eval_v1.csv` to the friendly schema (`utils/alliance_schema.prep_paired_df`) and scores it via `predict_alliance.py`.
+5. **Real inference** (local for small batches, Colab for full 212k): `anymatch_alliance_inference.ipynb` joins the blocking output `data/alliance/candidate_pairs_*.parquet` with `data/alliance/MDM_Population_cleaned_v1.csv`, filters `valid_record=True`, and scores via `predict_alliance.py`.
 
 ## Patched files — do not revert
 
 | File | Patch | Why |
 |---|---|---|
-| `loo.py` | `--leaved_dataset_name none` trains on all 9 datasets (upstream always excludes one). Added `--save_model_path`; wired `save_model=True` into `train()`. | Patient records are out-of-distribution from all public EM datasets — no point holding one out. Without `save_model_path`, the checkpoint was discarded after each run. |
+| `loo.py` | `--leaved_dataset_name none` trains on all 9 datasets (upstream always excludes one). Added `--save_model_path`; wired `save_model=True` into `train()`. | Patient records are out-of-distribution from all public EM datasets — no point holding one out. Without `save_model_path`, the checkpoint was discarded after each run. **Note:** `loo.py` can only train a fresh GPT-2 base on the 9 prepared dirs — it cannot resume from a checkpoint or read flat pair CSVs, which is why the fine-tune lives in `finetune_alliance.py`. |
 | `utils/train_eval.py` | Added `predict()` returning `(preds, probs)` for unlabeled inference. | Upstream `inference()` returns only F1/accuracy — useless for production scoring. |
 | `utils/data_utils.py` | Dropped unused top-level `from autogluon.tabular import TabularPredictor`. Also capped `one_pos_two_neg` negative sampling at `len(neg_pairs)`. | The autogluon import pulled in TensorFlow/abseil and hung local Python for ~8 minutes (visible as `[mutex.cc : 452] RAW: Lock blocking`). The sampling cap fixes `Cannot take a larger sample than population` on near-balanced datasets like WDC. |
 | `data/preprocess.ipynb` | autogluon import made optional; WDC valid-set merge bug fixed; MatchGPT pickle override skipped; WDC test prep enabled; attr-pair prep enabled. | See `SETUP.md` for cell-level detail. |
@@ -27,8 +28,9 @@ A **patched fork** of [Jantory/anymatch](https://github.com/Jantory/anymatch) (Z
 ## New files (not in upstream)
 
 - `predict_alliance.py` — inference CLI. Reads any CSV with `*_l` / `*_r` columns + optional `label`, writes the same CSV + `pred` / `match_prob`. Other columns (e.g. `PATID_A`, `PATID_B`) ride through untouched because `df_serializer` only consumes `_l` / `_r`-suffixed columns.
-- `anymatch_training.ipynb`, `anymatch_synthetic_inference.ipynb`, `anymatch_alliance_inference.ipynb` — the three end-to-end notebooks.
-- `data/synthetic/alliance_pairs_synthetic.csv` — 18 hand-crafted pairs (10 matches, 8 non-matches) for sanity-checking before real data.
+- `finetune_alliance.py` — **sequential fine-tune** CLI. Resumes from a checkpoint dir (`GPT2ForSequenceClassification.from_pretrained(base_checkpoint)`), reads the synthetic `_l`/`_r` pair CSVs, renames technical→friendly via `utils/alliance_schema`, serializes mode4, trains via the existing `train()`, early-stops on the entity-disjoint test, and reports a final realistic-eval (1:9) F1. Gentle defaults: `--lr 1e-5 --epochs 10 --patience 3`.
+- `utils/alliance_schema.py` — **single source of truth** for the AllianceChicago feature schema. `CANONICAL_RENAMES` (technical MDM column → clean English attribute name; full spec §2: three separate name fields + `suffix`, `address2`, `ssn`, `ssn4`, `email`), plus `id_str_dtypes`, `serialize_set_field`, `prep_record_df` (per-record path for alliance inference), `prep_paired_df` (already-paired path for synthetic inference + fine-tune training). **Both inference notebooks and `finetune_alliance.py` import this** so train and serve serialize identical attribute names — drift here silently hurts accuracy.
+- `anymatch_training.ipynb`, `anymatch_finetuning.ipynb`, `anymatch_synthetic_inference.ipynb`, `anymatch_alliance_inference.ipynb` — the four end-to-end notebooks.
 - `docs/Data-Cleaning-Guide.md` — field-by-field cleaning rules applied to MDM_Population to produce `*_clean` columns + `valid_record` + derived `full_name_tokens` / `Phones_set` / `Address_normalized`. Any synthetic data we generate must conform to these conventions.
 - `synthetic_data_generation/` — design + tooling for a domain-shift fine-tuning corpus (see next section).
 
@@ -43,12 +45,12 @@ The zero-shot mode4 checkpoint underperforms on FQHC patient pairs in two specif
 - `synthetic_data_generation/qa_checks.py` — asserts every §12 check; run after generation: `python synthetic_data_generation/qa_checks.py --version 1`.
 - Outputs (4 files): `finetune_{train,test}_v1.csv` (balanced 1:1.5, case-first, entity-disjoint), `realistic_eval_v1.csv` (1:9, entity-first), `blocking_eval_v1.csv` (record-level, full cleaning schema + `entity_id`). Provenance (`entity_id`, `case_type`, `corruptions_applied`, split) rides inline in these files — no separate manifest files.
 
-Gotchas: pair CSVs use `_l`/`_r` for model columns and `_A`/`_B` (+ `entity_id_a/b`, `case_type`, `corruptions_applied`) for provenance that `df_serializer` skips. `Address_normalized` is emitted **null** to match the real cleaned file (libpostal wasn't run there). The fine-tune three-name-field schema (§2) supersedes the old single derived `name` — the alliance inference `FEATURE_RENAMES` must be updated to match before scoring with a fine-tuned checkpoint.
+Gotchas: pair CSVs use `_l`/`_r` for model columns and `_A`/`_B` (+ `entity_id_a/b`, `case_type`, `corruptions_applied`) for provenance that `df_serializer` skips. `Address_normalized` is emitted **null** to match the real cleaned file (libpostal wasn't run there). The fine-tune three-name-field schema (§2) supersedes the old single derived `name`; this is now **resolved** — both inference notebooks and `finetune_alliance.py` import the three-name `CANONICAL_RENAMES` from `utils/alliance_schema.py`, so train/serve are consistent. The generated `finetune_*`/`realistic_eval`/`blocking_eval` CSVs carry **technical** column names (`FirstNM_clean_l`, …); the friendly rename happens at load time via `prep_paired_df`.
 
 ## Model mechanics (important when changing the prompt or features)
 
 - Base: `GPT2ForSequenceClassification` (GPT-2 124M + `Linear(768, 2)` head). **Not** a generator — the classification head reads the hidden state of the last non-padding token. `softmax(logits, dim=-1)[:, 1]` = `match_prob`.
-- Serialization (`utils/data_utils.py::df_serializer`). The production checkpoint is trained with **mode4**: each pair becomes `Given the attributes of two records, are they the same? Record A is name: <v>, dob: <v>, ssn: <v>, .... Record B is name: <v>, dob: <v>, ssn: <v>, ....`. Attribute names come from the dataframe column names (sans `_l`/`_r`), so the alliance inference notebook applies a `FEATURE_RENAMES` map to convert technical MDM column names (`BirthDT_clean`, `ZipCD_clean_base`) to clean lowercase English (`dob`, `zip`) — that's what the model saw during training and any drift hurts accuracy. The old **mode1** checkpoint (positional `COL v1, COL v2, ...` template, no attribute names) is kept at `saved_models/anymatch_all9_gpt2/` for A/B. Inference and training serialization mode must always match the checkpoint.
+- Serialization (`utils/data_utils.py::df_serializer`). The production checkpoint is trained with **mode4**: each pair becomes `Given the attributes of two records, are they the same? Record A is first_name: <v>, middle_name: <v>, last_name: <v>, suffix: <v>, dob: <v>, ssn: <v>, ssn4: <v>, .... Record B is ....`. Attribute names come from the dataframe column names (sans `_l`/`_r`), so the friendly schema is centralized in `utils/alliance_schema.py::CANONICAL_RENAMES` (imported by both inference notebooks **and** `finetune_alliance.py`) to convert technical MDM column names (`FirstNM_clean`, `BirthDT_clean`, `ZipCD_clean_base`) to clean English (`first_name`, `dob`, `zip`). Any drift between train and serve hurts accuracy — change the schema in that one module, never inline. The old **mode1** checkpoint (positional `COL v1, COL v2, ...` template, no attribute names) is kept at `saved_models/anymatch_all9_gpt2/` for A/B. Inference and training serialization mode must always match the checkpoint.
 - Missing values are replaced with the literal string `'N/A'` via `.fillna('N/A')` — the model has seen this thousands of times in training and treats both-sides-`N/A` as neutral.
 - GPT-2 context cap is **1024 tokens**. With ~10 feature columns per side, real patient pairs fit comfortably; check token length with `tokenizer.encode(text)` if you add many columns.
 
@@ -64,6 +66,21 @@ python loo.py --seed 42 --base_model gpt2 --leaved_dataset_name none \
 ```
 
 `one_pos_two_neg` skips the autogluon dependency (~1 GB). For the paper's best result use `automl_filter` instead, which requires running the AutoML cell in `data/preprocess.ipynb` and installing autogluon.
+
+Fine-tune the all9 checkpoint on the synthetic corpus (sequential; A100 recommended):
+
+```sh
+python finetune_alliance.py \
+    --base_checkpoint saved_models/anymatch_all9_gpt2_mode4 \
+    --train_csv data/synthetic/finetune_train_v1.csv \
+    --valid_csv data/synthetic/finetune_test_v1.csv \
+    --eval_csv  data/synthetic/realistic_eval_v1.csv \
+    --save_model_path saved_models/anymatch_alliance_ft_v1 \
+    --base_model gpt2 --serialization_mode mode4 \
+    --lr 1e-5 --epochs 10 --patience 3
+```
+
+`--serialization_mode` must match the base checkpoint (mode4). `--valid_csv` should be the entity-disjoint `finetune_test` (drives early stopping); `--eval_csv` is the realistic 1:9 set reported at the end. Lower `--lr` (5e-6) or `--patience` if the §7 regression check shows public-EM F1 dropping (catastrophic forgetting).
 
 Predict on an unlabeled pairs CSV:
 
@@ -87,22 +104,29 @@ python predict_alliance.py \
 ## Layout sketch
 
 ```
-loo.py                 # training entry point (patched)
+loo.py                 # base training entry point (patched; trains GPT-2 on the 9 datasets)
+finetune_alliance.py   # sequential fine-tune CLI (new; resumes from checkpoint, synthetic corpus)
 predict_alliance.py    # inference CLI (new)
 inference.py           # upstream evaluation script (kept for reference)
 model.py, data.py      # model + dataset class loaders (unchanged)
 utils/
   data_utils.py        # df_serializer (mode1..4), sampling funcs (patched)
   train_eval.py        # train(), evaluate(), inference(), predict() (patched)
+  alliance_schema.py   # CANONICAL_RENAMES + prep_record_df/prep_paired_df (new; shared by train+infer)
 data/
   raw/<dataset>/       # 8 Magellan deepmatcher zips + WDC
   prepared/<dataset>/  # output of preprocess.ipynb
-  synthetic/           # alliance_pairs_synthetic.csv + (future) finetune_train/test, realistic_eval
+  synthetic/           # finetune_{train,test}_v1, realistic_eval_v1, blocking_eval_v1 (generated)
   alliance/            # candidate_pairs_*.parquet, MDM_Population_cleaned_v1.csv
 docs/
   Data-Cleaning-Guide.md   # MDM cleaning rules (drives synthetic-data conventions)
 synthetic_data_generation/
-  Synthetic-Dataset-Spec.md # scenario catalog + generation plan (v0.1 scaffold)
-  extract_mdm_stats.py      # aggregate-stats extractor for spec [TBD]s
+  Synthetic-Dataset-Spec.md # scenario catalog + generation plan (v0.4, build-complete)
+  extract_mdm_stats.py      # aggregate-stats extractor
+  build_pools.py            # offline-first vocab-pool builder
+  generate_synthetic.py     # the generator (byte-reproducible from --seed)
+  qa_checks.py              # asserts the §12 structural checks
+anymatch_training.ipynb / anymatch_finetuning.ipynb            # Colab: base train, then fine-tune
+anymatch_synthetic_inference.ipynb / anymatch_alliance_inference.ipynb  # local inference
 saved_models/          # trained checkpoints (download from Drive)
 ```
