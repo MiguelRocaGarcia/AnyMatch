@@ -55,14 +55,14 @@ A synthetic, AllianceChicago-shaped pair corpus for fine-tuning (and for testing
    Writes `synthetic_data_generation/pools/{first_names,last_names,streets,nicknames,initial_expansion}.json`.
 3. **Generate the corpus** (deterministic from `--seed`; ~4 s for the full 40k+10k build):
    ```sh
-   python synthetic_data_generation/generate_synthetic.py --seed 42 --version 1
+   python synthetic_data_generation/generate_synthetic.py --seed 42 --version 2
    ```
-   Writes four files to `data/synthetic/` at `v1`: `finetune_train` / `finetune_test` (balanced 1:1.5, case-first, entity-disjoint), `realistic_eval` (1:9, entity-first), `blocking_eval` (record-level, full cleaning schema + `entity_id`). Ground-truth provenance (`entity_id`, `case_type`, `corruptions_applied`, split) is carried inline in these files — no separate manifest files. Use `--smoke` for a quick tiny run.
+   Writes **two** files to `data/synthetic/` at `v2` (v0.5 hybrid design): `synthetic_train` (balanced ~1:1.5; realistic entity-first bulk + budgeted hard-scenario overlay + dirty tail) and `synthetic_test` (realistic prevalence, blocking-survivor-like hard negatives only, entity-disjoint from train). Ground-truth provenance (`entity_id_a/b`, `case_type`, `corruptions_applied`) is carried inline — no separate manifest files. Use `--smoke` for a quick tiny run.
 4. **Validate**:
    ```sh
-   python synthetic_data_generation/qa_checks.py --version 1
+   python synthetic_data_generation/qa_checks.py --version 2
    ```
-   Asserts every §12 check. Add `--real-header /path/to/MDM_Population_cleaned_v1.csv` to also assert exact `blocking_eval` schema parity against the real cleaned header.
+   Asserts the §12 checks: schema/mode4 parity, realistic missingness (±3pp), the positive multi-corruption heavy-tail, 100% key-sharing test negatives, entity disjointness, and the structural SSN/phone/token rules.
 
 The fine-tune pair CSVs are drop-in for `loo.py` (model reads `*_l`/`*_r` + `label`; provenance columns are skipped by `df_serializer`). Note: the synthetic schema passes `first_name`/`middle_name`/`last_name` as **three separate fields** (spec §2), which supersedes the single derived `name` the current alliance inference notebook uses — update its `FEATURE_RENAMES` to match before scoring with a fine-tuned checkpoint.
 

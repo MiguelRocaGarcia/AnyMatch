@@ -1,14 +1,15 @@
 """Synthetic FQHC patient-pair generator for AnyMatch fine-tuning.
 
-Implements Synthetic-Dataset-Spec.md §6-§11. Deterministic from --seed.
+Implements Synthetic-Dataset-Spec.md §6-§11 (v0.5 hybrid design). Deterministic from --seed.
 
 Outputs (data/synthetic/, vN-versioned):
-  finetune_train_vN.csv / finetune_test_vN.csv   pair-level, balanced corpus (case-first)
-  realistic_eval_vN.csv                          pair-level, realistic prevalence (entity-first)
-  blocking_eval_vN.csv                           record-level, full cleaning schema + entity_id
+  synthetic_train_vN.csv   pair-level, balanced ~1:1.5, realistic bulk + hard-scenario overlay
+  synthetic_test_vN.csv    pair-level, realistic prevalence, blocking-survivor-like hard negatives
+
+Both share the identical column layout; train/test are entity-disjoint by construction.
 
 Run from the AnyMatch/ directory:
-  python synthetic_data_generation/generate_synthetic.py --seed 42 --version 1
+  python synthetic_data_generation/generate_synthetic.py --seed 42 --version 2
 """
 
 from __future__ import annotations
@@ -148,6 +149,14 @@ class Pools:
         f, l = rd("first_names.json"), rd("last_names.json")
         s = rd("streets.json")
         nick = rd("nicknames.json")
+        # Drop any pool name the cleaning step would have flagged invalid (e.g. the
+        # surname "NA", which is on the text-null invalid list) so we never emit it.
+        def _clean_weighted(items):
+            return [(n, w) for n, w in items if is_clean_token(n)]
+        def _clean_flat(items):
+            return [n for n in items if is_clean_token(n)]
+        f["weighted_head"] = _clean_weighted(f["weighted_head"]); f["tail"] = _clean_flat(f["tail"])
+        l["weighted_head"] = _clean_weighted(l["weighted_head"]); l["tail"] = _clean_flat(l["tail"])
         # Build a symmetric lookup: every name form maps to the set of all its
         # equivalents (including the canonical).
         lookup: dict[str, list] = {}
@@ -520,14 +529,18 @@ def _typo(rng: random.Random, s: str) -> str:
     i = rng.randrange(len(s))
     op = rng.choice(["sub", "del", "ins", "trans"])
     if op == "sub":
-        return s[:i] + rng.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ") + s[i + 1:]
-    if op == "del":
-        return s[:i] + s[i + 1:]
-    if op == "ins":
-        return s[:i] + rng.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ") + s[i:]
-    if op == "trans" and i < len(s) - 1:
-        return s[:i] + s[i + 1] + s[i] + s[i + 2:]
-    return s
+        out = s[:i] + rng.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ") + s[i + 1:]
+    elif op == "del":
+        out = s[:i] + s[i + 1:]
+    elif op == "ins":
+        out = s[:i] + rng.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ") + s[i:]
+    elif op == "trans" and i < len(s) - 1:
+        out = s[:i] + s[i + 1] + s[i] + s[i + 2:]
+    else:
+        out = s
+    # A typo must not produce a token the cleaning step would flag invalid
+    # (e.g. deleting "ANA" -> "NA"); fall back to the original in that case.
+    return out if is_clean_token(out) else s
 
 
 class Corruptions:
@@ -690,6 +703,60 @@ class Corruptions:
         c["SexAtBirthDSC_clean"] = "FEMALE" if s == "MALE" else "MALE"
         return "sex_flip"
 
+    # -- structural name transforms (§8.4 additions) ----------------------- #
+    def first_to_initial(self, c):
+        f = c.get("FirstNM_clean")
+        if not f or len(f.split()[0]) < 2:
+            return None
+        c["FirstNM_clean"] = f.split()[0][0]
+        return "first_to_initial"
+
+    def truncate_name(self, c):
+        f = c.get("LastNM_clean")
+        if not f or len(f) < 7:
+            return None
+        c["LastNM_clean"] = f[: max(5, len(f) - self.rng.randint(1, 3))]
+        return "truncate_name"
+
+    def concat_spaces(self, c):
+        for key in ("LastNM_clean", "FirstNM_clean"):
+            v = c.get(key)
+            if v and " " in v:
+                c[key] = v.replace(" ", "")
+                return "concat_spaces"
+        return None
+
+    def cross_lang_variant(self, c):
+        # reuse the nickname/equivalence pool (seeded with GUILLERMO<->WILLIAM etc.)
+        return self.nickname(c) and "cross_lang_variant"
+
+    def name_order_swap(self, c):
+        f, l = c.get("FirstNM_clean"), c.get("LastNM_clean")
+        if not f or not l:
+            return None
+        c["FirstNM_clean"], c["LastNM_clean"] = l, f
+        return "name_order_swap"
+
+    def move_within_zip(self, c):
+        if not c.get("AddressLine1_clean"):
+            return None
+        c["AddressLine1_clean"] = self.gen.sample_street_address()
+        return "move_within_zip"
+
+    def directional_expand(self, c):
+        a = c.get("AddressLine1_clean")
+        if not a:
+            return None
+        repl = {" N ": " NORTH ", " S ": " SOUTH ", " E ": " EAST ", " W ": " WEST ",
+                " ST": " STREET", " AVE": " AVENUE", " RD": " ROAD", " DR": " DRIVE"}
+        out = a
+        for k, v in repl.items():
+            out = out.replace(k, v)
+        if out == a:
+            return None
+        c["AddressLine1_clean"] = out
+        return "directional_expand"
+
 
 # --------------------------------------------------------------------------- #
 # Variant generation (entity-first) + scenario construction (case-first)
@@ -700,46 +767,54 @@ def clone(canonical: dict) -> dict:
     return c
 
 
-def apply_calibrated_corruptions(gen: Generator, base: dict) -> tuple[dict, list]:
+def apply_calibrated_corruptions(gen: Generator, base: dict, messiness: float = 1.0) -> tuple[dict, list]:
     """Produce one corrupted variant of `base`, applying each field's corruption
-    independently at the §7 calibrated marginal (the locked application model)."""
+    independently at the §7 calibrated marginal (the locked application model).
+
+    `messiness > 1.0` is the §7 dirty-tail multiplier: it scales every field's
+    P(differs) up *together* (capped near 1.0), so corruptions correlate and many
+    fields drift at once — the "everything is a mess" tail the marginals alone miss.
+    """
     corr = Corruptions(gen)
     c = clone(base)
     applied = []
     rng = gen.rng
 
+    def p(field):  # calibrated marginal, amplified by the messiness multiplier
+        return min(DIFFER_RATES[field] * messiness, 0.97)
+
     # Name: last-name change dominates; pick change type when it fires.
-    if rng.random() < DIFFER_RATES["last_name"]:
+    if rng.random() < p("last_name"):
         roll = rng.random()
         fn = (corr.replace_last if roll < 0.45 else
               corr.drop_one_surname if roll < 0.6 else corr.typo_last)
         applied.append(fn(c) or corr.typo_last(c))
-    if rng.random() < DIFFER_RATES["first_name"]:
+    if rng.random() < p("first_name"):
         fn = corr.nickname if rng.random() < 0.4 else corr.typo_first
         applied.append(fn(c) or corr.typo_first(c))
     # Middle
-    if c.get("MiddleNM_clean") and rng.random() < DIFFER_RATES["middle_change"]:
+    if c.get("MiddleNM_clean") and rng.random() < p("middle_change"):
         fn = rng.choice([corr.middle_to_initial, corr.expand_initial])
         applied.append(fn(c))
-    if rng.random() < DIFFER_RATES["middle_one_missing"]:
+    if rng.random() < p("middle_one_missing"):
         applied.append(corr.drop_middle(c))
     # DOB (rare; off-by-one inside dob_drift is itself rare)
-    if rng.random() < DIFFER_RATES["dob"]:
+    if rng.random() < p("dob"):
         applied.append(corr.dob_drift(c))
     # Address
-    if rng.random() < DIFFER_RATES["address_move"]:
+    if rng.random() < p("address_move"):
         applied.append(corr.address_move(c))
     elif rng.random() < 0.2:
         applied.append(corr.change_apt(c))
     # Phone
-    if rng.random() < DIFFER_RATES["phone_no_overlap"]:
+    if rng.random() < p("phone_no_overlap"):
         applied.append(corr.phone_replace(c))
     # Email
-    if c.get("Email_clean") and rng.random() < DIFFER_RATES["email"]:
+    if c.get("Email_clean") and rng.random() < p("email"):
         fn = corr.email_domain_typo if rng.random() < 0.15 else corr.email_change
         applied.append(fn(c) or corr.email_change(c))
     # Sex (very rare)
-    if rng.random() < DIFFER_RATES["sex"]:
+    if rng.random() < p("sex"):
         applied.append(corr.sex_flip(c))
 
     return c, [a for a in applied if a]
@@ -1223,6 +1298,56 @@ class ScenarioLib:
     def m_mix_thin(self):
         return self.m_nossn_thin()[:5] + ("M-MIX-03", [])
 
+    # ---- §8.4 additional structural hard MATCH cases ---- #
+    def m_name_first_initial(self):
+        e = self._ent()
+        A, B = clone(e.canonical), clone(e.canonical)
+        c = self.corr.first_to_initial(B) or self.corr.typo_first(B)
+        return A, e.entity_id, B, e.entity_id, 1, "M-NAME-13", [c]
+
+    def m_name_truncate(self):
+        e = self._ent()
+        e.canonical["LastNM_clean"] = self.rng.choice(
+            ["MASSIMILIANO", "HERNANDEZHERNANDEZ", "GUTIERREZRAMIREZ", "WASHINGTON"])
+        A, B = clone(e.canonical), clone(e.canonical)
+        c = self.corr.truncate_name(B) or self.corr.typo_last(B)
+        return A, e.entity_id, B, e.entity_id, 1, "M-NAME-14", [c]
+
+    def m_name_crosslang(self):
+        canon = self.rng.choice(list(self.gen.pools.nicknames.keys()))
+        e = self._ent()
+        e.canonical["FirstNM_clean"] = canon
+        A, B = clone(e.canonical), clone(e.canonical)
+        B["FirstNM_clean"] = self.rng.choice(self.gen.pools.nicknames[canon])
+        return A, e.entity_id, B, e.entity_id, 1, "M-NAME-15", ["cross_lang_variant"]
+
+    def m_name_concat(self):
+        e = self._ent()
+        e.canonical["LastNM_clean"] = self.rng.choice(
+            ["DE LA CRUZ", "DE LEON", "SAN MIGUEL", "MARY ANN"])
+        A, B = clone(e.canonical), clone(e.canonical)
+        c = self.corr.concat_spaces(B)
+        return A, e.entity_id, B, e.entity_id, 1, "M-NAME-16", [c or "concat_spaces"]
+
+    def m_addr_within_zip(self):
+        e = self._ent(); self.ensure_address(e)
+        A, B = clone(e.canonical), clone(e.canonical)
+        self.corr.move_within_zip(B)
+        return A, e.entity_id, B, e.entity_id, 1, "M-ADDR-05", ["move_within_zip"]
+
+    def m_addr_directional(self):
+        e = self._ent(); self.ensure_address(e)
+        e.canonical["AddressLine1_clean"] = f"{self.rng.randint(100,9999)} N MAIN ST"
+        A, B = clone(e.canonical), clone(e.canonical)
+        self.corr.directional_expand(B)
+        return A, e.entity_id, B, e.entity_id, 1, "M-ADDR-06", ["directional_expand"]
+
+    def m_zip_drift(self):
+        e = self._ent(); self.ensure_address(e)
+        A, B = clone(e.canonical), clone(e.canonical)
+        B["ZipCD_clean_base"] = self.corr._new_zip(B.get("CityNM_clean"), B.get("ZipCD_clean_base"))
+        return A, e.entity_id, B, e.entity_id, 1, "M-ZIP-01", ["zip_drift"]
+
     # ======================= NON-MATCH scenarios (label=0) ================ #
     def _two(self, **force):
         return self._ent(**force), self._ent(**force)
@@ -1421,6 +1546,37 @@ class ScenarioLib:
         b["BirthDT_clean"] = a["BirthDT_clean"].replace(str(y), str(max(y - 8, 1900)), 1)
         return a, eid_a, b, eid_b, 0, "NM-BND-02", []
 
+    # ---- §8.4 additional hard NON-MATCH cases ---- #
+    def nm_common_adjacent_dob(self):
+        a, b = self._two()
+        f, l = self.gen.sample_first(), self.gen.sample_last()
+        for e in (a, b):
+            e.canonical["FirstNM_clean"] = f; e.canonical["LastNM_clean"] = l
+        y, m, d = map(int, a.canonical["BirthDT_clean"].split("-"))
+        try:
+            b.canonical["BirthDT_clean"] = date(y, m, d).replace(
+                day=min(max(d + self.rng.choice([-2, -1, 1, 2]), 1), 28)).isoformat()
+        except ValueError:
+            pass
+        b.canonical["SSN_clean"] = b.canonical["last_4_SSN"] = None
+        return clone(a.canonical), a.entity_id, clone(b.canonical), b.entity_id, 0, "NM-COMMON-06", []
+
+    def nm_cousin(self):
+        a, b = self._two(); self.ensure_address(a); self.ensure_address(b)
+        shared = self.gen.sample_last()
+        a.canonical["LastNM_clean"] = b.canonical["LastNM_clean"] = shared
+        b.canonical["CityNM_clean"] = a.canonical["CityNM_clean"]
+        b.canonical["ZipCD_clean_base"] = a.canonical["ZipCD_clean_base"]
+        b.canonical["SSN_clean"] = b.canonical["last_4_SSN"] = None
+        return clone(a.canonical), a.entity_id, clone(b.canonical), b.entity_id, 0, "NM-HH-COUSIN", []
+
+    def nm_last4_dob(self):
+        a, b = self._two(); self.ensure_last4_only(a)
+        b.canonical["SSN_clean"] = None
+        b.canonical["last_4_SSN"] = a.canonical["last_4_SSN"]
+        b.canonical["BirthDT_clean"] = a.canonical["BirthDT_clean"]
+        return clone(a.canonical), a.entity_id, clone(b.canonical), b.entity_id, 0, "NM-SSN-06", []
+
 
 # Bucket -> (weight-of-side, [scenario method names]). Flag-gated scenarios
 # (§8.3) excluded by default.
@@ -1477,54 +1633,231 @@ def test_entities(entity_ids, seed, frac=0.15):
     return out
 
 
-def build_finetune(gen, pb, n_match, n_nonmatch):
-    lib = ScenarioLib(gen)
+# --------------------------------------------------------------------------- #
+# Hybrid assembly (v0.5): realistic entity-first BULK + budgeted hard-scenario
+# OVERLAY. Train and test draw their own freshly-sampled entities, so the two
+# files are entity-disjoint by construction (every make_entity mints a new id).
+# --------------------------------------------------------------------------- #
+def recompute_derived(rec: dict) -> None:
+    """Recompute the derived name/phone columns after a key-share mutation so the
+    serialized name fields and their token/compact/phone derivations stay consistent."""
+    rec["full_name_tokens"] = " ".join(split_name_tokens(
+        rec["FirstNM_clean"], rec["MiddleNM_clean"], rec["LastNM_clean"])) or None
+    rec["full_name_compact"] = name_compact(
+        rec["FirstNM_clean"], rec["MiddleNM_clean"], rec["LastNM_clean"])
+    phones = rec["Phones_set"].split() if rec.get("Phones_set") else []
+    rec["Phones_set"] = phones_set(phones)
+
+
+# --------------------------------------------------------------------------- #
+# Difficulty design (v0.5, §8.4): SSN bands + no-identical + hard (key-sharing) NM.
+# Coverage methods guarantee EVERY named scenario appears many times; the bulk
+# supplies realistic volume. enforce_positive() applies the SSN band + address
+# rule to *every* positive (coverage or bulk) so the bands hold globally.
+# --------------------------------------------------------------------------- #
+SSN_COVER = ["m_ssn_name_typo", "m_ssn_missing_middle", "m_ssn_maiden_married",
+             "m_ssn_moved", "m_ssn_moved_oos", "m_ssn_diff_contact",
+             "m_ssn_dob_drift", "m_ssn_heavy_drift"]
+L4_COVER = ["m_l4_name_typo", "m_l4_dob_drift", "m_l4_asym", "m_l4_asym_namedrift",
+            "m_ssn_full_vs_last4"]
+HARD_COVER = [
+    "m_nossn_addr_moved", "m_nossn_phone_overlap", "m_nossn_name_typo",
+    "m_name_hyphen", "m_name_first_middle_swap", "m_name_two_surname_shuffle",
+    "m_name_two_surname_collapse", "m_name_vietnamese_swap", "m_name_middle_initial",
+    "m_name_compound_first_dropped", "m_name_suffix", "m_name_suffix_wrong_slot",
+    "m_name_nickname", "m_name_typo_sub", "m_name_typo_trans", "m_name_typo_insdel",
+    "m_name_first_initial", "m_name_truncate", "m_name_crosslang", "m_name_concat",
+    "m_addr_apt_toggle", "m_addr_apt_change", "m_addr_line2_absorb", "m_addr_house_typo",
+    "m_addr_within_zip", "m_addr_directional", "m_zip_drift",
+    "m_dob_transpose", "m_dob_off_year", "m_dob_off_day", "m_dob_null",
+    "m_phone_partial", "m_phone_disjoint", "m_email_change", "m_email_domain_typo",
+    "m_sex_other", "m_ped_name_drift", "m_mix_two", "m_mix_three"]
+
+NM_EASY_COVER = ["nm_random", "nm_same_state"]
+NM_HARD_COVER = [
+    "nm_twin", "nm_triplet_like", "nm_jr_sr", "nm_sibling", "nm_parent_child",
+    "nm_spouse", "nm_roommate", "nm_common_name_city", "nm_common_name_zip",
+    "nm_hispanic_surname", "nm_top_zip_collision", "nm_areacode",
+    "nm_common_adjacent_dob", "nm_cousin", "nm_last4_collision", "nm_last4_first_letter",
+    "nm_ssn_typo_collision", "nm_ssn_opposite_sex", "nm_full_vs_mismatch_last4",
+    "nm_last4_dob", "nm_shelter_addr", "nm_family_phone", "nm_family_email",
+    "nm_addr_and_phone", "nm_ped_siblings", "nm_ped_same_dob",
+    "nm_thin_diff_name", "nm_thin_diff_dob"]
+
+_NAME_DOB_ADDR = ["FirstNM_clean", "LastNM_clean", "BirthDT_clean", "AddressLine1_clean"]
+
+
+def _identical(recA, recB):
+    return all((recA.get(c) or "") == (recB.get(c) or "") for c in _NAME_DOB_ADDR)
+
+
+def enforce_positive(gen: Generator, recA: dict, recB: dict, band: str) -> None:
+    """Apply the §8.4 SSN band + address rule to a positive pair, and guarantee
+    >=1 difference (no identical pairs)."""
+    if band == "easy":
+        ssn = recA.get("SSN_clean") or recB.get("SSN_clean") or gen.gen_ssn()
+        for r in (recA, recB):
+            r["SSN_clean"], r["last_4_SSN"] = ssn, ssn[-4:]
+    elif band == "last4":
+        l4 = recA.get("last_4_SSN") or recB.get("last_4_SSN") or gen.gen_last4()
+        for r in (recA, recB):
+            r["SSN_clean"], r["last_4_SSN"] = None, l4
+    else:  # hard: no usable SSN match on >=1 side
+        for r in (recA, recB):
+            t = gen.rng.random()
+            if t < 0.75:
+                r["SSN_clean"] = r["last_4_SSN"] = None        # neither
+            elif t < 0.90:
+                r["SSN_clean"] = None                          # last-4 only
+        if recA.get("SSN_clean") and recA["SSN_clean"] == recB.get("SSN_clean"):
+            recB["SSN_clean"] = None
+        if recA.get("last_4_SSN") and recA["last_4_SSN"] == recB.get("last_4_SSN"):
+            recB["last_4_SSN"] = None
+        # high-mobility population: address rarely matches between true pairs
+        if (recA.get("AddressLine1_clean") and recA["AddressLine1_clean"] == recB.get("AddressLine1_clean")
+                and gen.rng.random() < 0.85):
+            recB["AddressLine1_clean"] = gen.sample_street_address()
+    # never emit an identical pair: guarantee >=1 difference on a name/dob field
+    if _identical(recA, recB):
+        corr = Corruptions(gen)
+        for fn in (corr.typo_last, corr.typo_first, corr.nickname):
+            fn(recB)
+            if not _identical(recA, recB):
+                break
+        else:
+            recB["LastNM_clean"] = gen.sample_last()  # last-resort guaranteed change (maiden-style)
+    recompute_derived(recB)
+
+
+def _band_plan(n, easy=0.05, last4=0.15):
+    n_easy = round(n * easy)
+    n_l4 = round(n * last4)
+    return n_easy, n_l4, n - n_easy - n_l4
+
+
+def _run_methods(gen, pb, lib, methods, count, enforce_band=None):
+    """Round-robin `methods` to produce `count` pairs; if enforce_band is set the
+    pairs are positives and get the SSN-band rule applied."""
     rows = []
-    for buckets, total in ((MATCH_BUCKETS, n_match), (NM_BUCKETS, n_nonmatch)):
-        for method, count in allocate(buckets, total):
-            fn = getattr(lib, method)
-            for _ in range(count):
-                cA, eidA, cB, eidB, label, case, corr = fn()
-                recA = pb.emit_record(cA, eidA)
-                recB = pb.emit_record(cB, eidB)
-                rows.append(pair_row(recA, recB, label, case, corr))
+    i = 0
+    while len(rows) < count:
+        fn = getattr(lib, methods[i % len(methods)])
+        i += 1
+        cA, eidA, cB, eidB, label, case, corr = fn()
+        recA, recB = pb.emit_record(cA, eidA), pb.emit_record(cB, eidB)
+        if enforce_band is not None:
+            enforce_positive(gen, recA, recB, enforce_band)
+        rows.append(pair_row(recA, recB, label, case, corr))
     return rows
 
 
-def coarse_nm_case(recA, recB):
-    if recA["AddressLine1_clean"] and recA["AddressLine1_clean"] == recB["AddressLine1_clean"]:
-        return "NM-HH/IDF"
-    if recA["full_name_compact"] == recB["full_name_compact"]:
-        return "NM-COMMON"
-    return "NM-EASY"
+def make_positive(gen: Generator, pb: "PairBuilder", band: str, dirty_frac: float) -> dict:
+    """Bulk within-entity match pair for a given SSN band, corruption scaled by band."""
+    e = gen.make_entity()
+    recA = pb.emit_record(e.canonical, e.entity_id)
+    if band == "easy":
+        messiness, case = gen.rng.uniform(1.0, 1.6), "M-BULK-EASY"
+    elif band == "last4":
+        messiness, case = gen.rng.uniform(1.3, 2.2), "M-BULK-L4"
+    else:
+        messiness = gen.rng.uniform(2.0, 3.5) if gen.rng.random() < dirty_frac else gen.rng.uniform(1.5, 2.6)
+        case = "M-BULK-HARD"
+    variant, applied = apply_calibrated_corruptions(gen, e.canonical, messiness=messiness)
+    recB = pb.emit_record(variant, e.entity_id)
+    enforce_positive(gen, recA, recB, band)
+    return pair_row(recA, recB, 1, case, applied)
 
 
-def build_realistic(gen, pb, n_entities, target_pairs, pos_frac=0.10):
-    records, ent_recs, entities = pb.entity_first_records(n_entities)
-    match_rows, nonmatch_rows = [], []
-    # match pairs from multi-record entities
-    for eid, recs in ent_recs.items():
-        for i in range(len(recs)):
-            for j in range(i + 1, len(recs)):
-                match_rows.append(pair_row(recs[i], recs[j], 1, "M-REALISTIC", []))
-    # subsample matches to the positive budget, then draw 1:9 non-matches
-    n_match = min(len(match_rows), round(target_pairs * pos_frac))
-    if len(match_rows) > n_match:
-        match_rows = gen.rng.sample(match_rows, n_match)
-    target_nm = round(n_match * (1 - pos_frac) / pos_frac)
-    seen = set()
-    tries = 0
-    while len(nonmatch_rows) < target_nm and tries < target_nm * 40:
-        tries += 1
-        a, b = gen.rng.sample(records, 2)
-        if a["entity_id"] == b["entity_id"]:
-            continue
-        key = (a["PATID"], b["PATID"])
-        if key in seen:
-            continue
-        seen.add(key)
-        nonmatch_rows.append(pair_row(a, b, 0, coarse_nm_case(a, b), []))
-    return records, entities, match_rows + nonmatch_rows
+def force_shared_keys(gen: Generator, recA: dict, recB: dict, n_keys: int) -> str:
+    """Copy `n_keys` distinct strong fields from A onto B so a cross-entity NON-match
+    looks like a blocking survivor. Returns a case tag naming the shared keys."""
+    # Only structural blocking keys count (a shared common first name is not a real
+    # blocking key); first name may ride along as an extra when n_keys is high.
+    avail = []
+    if recA["LastNM_clean"]:        avail.append("lastname")
+    if recA["BirthDT_clean"]:       avail.append("dob")
+    if recA["AddressLine1_clean"]:  avail.append("addr")
+    if recA["last_4_SSN"]:          avail.append("last4")
+    if recA["Phones_set"]:          avail.append("phone")
+    if not avail:
+        avail = ["lastname"]
+    keys = gen.rng.sample(avail, min(n_keys, len(avail)))
+    if n_keys >= 3 and recA["FirstNM_clean"] and "lastname" in keys:
+        keys = keys + ["firstname"]   # common full-name collision
+    for key in keys:
+        if key == "lastname":
+            recB["LastNM_clean"] = recA["LastNM_clean"]
+        elif key == "firstname":
+            recB["FirstNM_clean"] = recA["FirstNM_clean"]
+        elif key == "dob":
+            recB["BirthDT_clean"] = recA["BirthDT_clean"]
+        elif key == "addr":
+            for f in ADDR_FIELDS:
+                recB[f] = recA[f]
+        elif key == "last4":
+            recB["last_4_SSN"] = recA["last_4_SSN"]; recB["SSN_clean"] = None
+        elif key == "phone":
+            existing = recB["Phones_set"].split() if recB["Phones_set"] else []
+            recB["Phones_set"] = phones_set([recA["Phones_set"].split()[0]] + existing)
+    recompute_derived(recB)
+    return "NM-HARD-" + "+".join(sorted(keys)).upper()
+
+
+def make_hard_negative(gen: Generator, pb: "PairBuilder") -> dict:
+    """Two distinct, realistically-corrupted people forced to share 1-3 strong keys."""
+    eA, eB = gen.make_entity(), gen.make_entity()
+    A, _ = apply_calibrated_corruptions(gen, eA.canonical)
+    B, _ = apply_calibrated_corruptions(gen, eB.canonical)
+    recA, recB = pb.emit_record(A, eA.entity_id), pb.emit_record(B, eB.entity_id)
+    n_keys = gen._weighted([1, 2, 3], [0.58, 0.30, 0.12])   # ~42% share >=2 keys
+    case = force_shared_keys(gen, recA, recB, n_keys)
+    return pair_row(recA, recB, 0, case, [])
+
+
+def _assemble(gen, pb, n_match, n_non, cover_frac, dirty_frac, easy_neg_frac):
+    """Shared assembly for train and test. Positives follow the §8.4 SSN bands
+    (5/15/80); negatives are `easy_neg_frac` easy + the rest hard (1-3 shared keys).
+    `cover_frac` of each band/group is filled from the enumerated catalog so EVERY
+    named scenario appears many times; the rest is realistic bulk. Train and test use
+    this same construction (so the test measures the same hard cases); they differ in
+    match prevalence, the disjoint entity pool, and easy-negative fraction (the test
+    is all-hard so precision is measured honestly)."""
+    lib = ScenarioLib(gen)
+    rows = []
+    # ---- positives: SSN bands ----
+    n_easy, n_l4, n_hard = _band_plan(n_match)
+    for band, n, cover in (("easy", n_easy, SSN_COVER),
+                           ("last4", n_l4, L4_COVER),
+                           ("hard", n_hard, HARD_COVER)):
+        n_cov = round(n * cover_frac)
+        rows += _run_methods(gen, pb, lib, cover, n_cov, enforce_band=band)
+        for _ in range(n - n_cov):
+            rows.append(make_positive(gen, pb, band, dirty_frac))
+    # ---- negatives: easy (train anchor only) / hard ----
+    n_neasy = round(n_non * easy_neg_frac)
+    n_nhard = n_non - n_neasy
+    if n_neasy:
+        rows += _run_methods(gen, pb, lib, NM_EASY_COVER, n_neasy)
+    n_nh_cov = round(n_nhard * cover_frac)
+    rows += _run_methods(gen, pb, lib, NM_HARD_COVER, n_nh_cov)
+    for _ in range(n_nhard - n_nh_cov):
+        rows.append(make_hard_negative(gen, pb))
+    gen.rng.shuffle(rows)
+    return rows
+
+
+def build_train(gen, pb, n_pairs, ratio=1.5, cover_frac=0.35, dirty_frac=0.25):
+    """Balanced ~1:ratio training corpus (§8.4 difficulty); keeps a 3% easy-negative anchor."""
+    n_match = round(n_pairs * (1.0 / (1.0 + ratio)))
+    return _assemble(gen, pb, n_match, n_pairs - n_match, cover_frac, dirty_frac, easy_neg_frac=0.03)
+
+
+def build_test(gen, pb, n_pairs, prevalence=0.10, cover_frac=0.35, dirty_frac=0.25):
+    """Honest evaluator: realistic prevalence, *identical difficulty construction to
+    train* (all named hard cases + SSN bands), on held-out entities, with **all-hard
+    negatives** (no random strangers) so precision reflects production."""
+    n_match = round(n_pairs * prevalence)
+    return _assemble(gen, pb, n_match, n_pairs - n_match, cover_frac, dirty_frac, easy_neg_frac=0.0)
 
 
 def write_pairs(rows, path):
@@ -1541,22 +1874,25 @@ def write_pairs(rows, path):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--version", type=int, default=1)
+    ap.add_argument("--version", type=int, default=2)
     ap.add_argument("--out-dir", default="data/synthetic")
     ap.add_argument("--pools", default=str(HERE / "pools"))
     ap.add_argument("--stats", default=str(HERE / "synthetic_data_stats.json"))
-    ap.add_argument("--finetune-match", type=int, default=16000)
-    ap.add_argument("--finetune-nonmatch", type=int, default=24000)
-    ap.add_argument("--realistic-pairs", type=int, default=10000)
-    ap.add_argument("--realistic-entities", type=int, default=14000,
-                    help="record population behind the realistic-eval / blocking-eval")
-    ap.add_argument("--test-frac", type=float, default=0.15)
+    ap.add_argument("--train-pairs", type=int, default=40000)
+    ap.add_argument("--train-ratio", type=float, default=1.5,
+                    help="non-match:match ratio in the training set (1:ratio)")
+    ap.add_argument("--test-pairs", type=int, default=10000)
+    ap.add_argument("--test-prevalence", type=float, default=0.20,
+                    help="positive fraction in the test set (1:4 -> enough positives for stable per-case recall)")
+    ap.add_argument("--overlay-frac", type=float, default=0.20,
+                    help="share of each split drawn from the hard-scenario overlay (rest = realistic bulk)")
+    ap.add_argument("--dirty-frac", type=float, default=0.20,
+                    help="share of positives drawn with the dirty-tail messiness multiplier")
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
 
     if args.smoke:
-        (args.finetune_match, args.finetune_nonmatch,
-         args.realistic_entities, args.realistic_pairs) = 1600, 2400, 2000, 1000
+        args.train_pairs, args.test_pairs = 4000, 1000
 
     stats = Stats.load(Path(args.stats))
     pools = Pools.load(Path(args.pools))
@@ -1565,30 +1901,20 @@ def main():
     out = Path(args.out_dir); out.mkdir(parents=True, exist_ok=True)
     v = args.version
 
-    # ---- fine-tune corpus (case-first) ----
-    ft_rows = build_finetune(gen, pb, args.finetune_match, args.finetune_nonmatch)
-    ft_eids = {r["entity_id_a"] for r in ft_rows} | {r["entity_id_b"] for r in ft_rows}
-    test_set = test_entities(sorted(ft_eids), args.seed, args.test_frac)
-    # A pair goes to test iff either side's entity is held out (§10).
-    def is_test(r):
-        return r["entity_id_a"] in test_set or r["entity_id_b"] in test_set
-    train_rows = [r for r in ft_rows if not is_test(r)]
-    test_rows = [r for r in ft_rows if is_test(r)]
-    write_pairs(train_rows, out / f"finetune_train_v{v}.csv")
-    write_pairs(test_rows, out / f"finetune_test_v{v}.csv")
+    # Train and test draw their own fresh entities -> entity-disjoint by construction.
+    train_rows = build_train(gen, pb, args.train_pairs, ratio=args.train_ratio,
+                             dirty_frac=args.dirty_frac)
+    test_rows = build_test(gen, pb, args.test_pairs, prevalence=args.test_prevalence,
+                           dirty_frac=args.dirty_frac)
+    write_pairs(train_rows, out / f"synthetic_train_v{v}.csv")
+    write_pairs(test_rows, out / f"synthetic_test_v{v}.csv")
 
-    # ---- realistic-eval (entity-first) + record-level blocking-eval ----
-    rec_list, _rl_entities, rl_rows = build_realistic(
-        gen, pb, args.realistic_entities, args.realistic_pairs)
-    write_pairs(rl_rows, out / f"realistic_eval_v{v}.csv")
-    rec_df = pd.DataFrame(rec_list)[RECORD_SCHEMA]
-    rec_df.to_csv(out / f"blocking_eval_v{v}.csv", index=False)
-
-    print(f"fine-tune: {len(train_rows)} train + {len(test_rows)} test "
-          f"({sum(r['label'] for r in ft_rows)} match / {len(ft_rows)} total)")
-    print(f"realistic-eval: {len(rl_rows)} pairs ({sum(r['label'] for r in rl_rows)} match), "
-          f"{len(rec_list)} records")
-    print(f"wrote 4 files to {out}/ at v{v}")
+    def summ(rows):
+        m = sum(r["label"] for r in rows)
+        return f"{len(rows)} pairs ({m} match / {len(rows) - m} non-match)"
+    print(f"synthetic_train_v{v}: {summ(train_rows)}")
+    print(f"synthetic_test_v{v}:  {summ(test_rows)}")
+    print(f"wrote 2 files to {out}/ at v{v}")
 
 
 if __name__ == "__main__":

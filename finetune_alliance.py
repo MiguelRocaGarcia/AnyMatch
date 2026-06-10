@@ -19,9 +19,10 @@ held-out test, to minimise catastrophic forgetting.
 Example (run from the AnyMatch/ directory):
     python finetune_alliance.py \\
         --base_checkpoint saved_models/anymatch_all9_gpt2_mode4 \\
-        --train_csv data/synthetic/finetune_train_v1.csv \\
-        --valid_csv data/synthetic/finetune_test_v1.csv \\
-        --save_model_path saved_models/anymatch_alliance_ft_v1 \\
+        --train_csv data/synthetic/synthetic_train_v2.csv \\
+        --valid_csv data/synthetic/synthetic_test_v2.csv \\
+        --eval_csv  data/synthetic/synthetic_test_v2.csv \\
+        --save_model_path saved_models/anymatch_alliance_ft_v2 \\
         --serialization_mode mode4
 """
 import argparse
@@ -58,9 +59,9 @@ def main():
     p = argparse.ArgumentParser(description='Sequential fine-tune of AnyMatch on the synthetic corpus.')
     p.add_argument('--base_checkpoint', required=True,
                    help='Directory of the trained checkpoint to resume from (e.g. the all9 mode4 model).')
-    p.add_argument('--train_csv', required=True, help='Synthetic finetune_train CSV (_l/_r + label).')
+    p.add_argument('--train_csv', required=True, help='Synthetic train CSV (_l/_r + label), e.g. synthetic_train_vN.')
     p.add_argument('--valid_csv', required=True,
-                   help='Held-out CSV for early stopping — use the entity-disjoint finetune_test.')
+                   help='Held-out CSV for early stopping — use the entity-disjoint synthetic_test.')
     p.add_argument('--save_model_path', required=True, help='Where to write the fine-tuned checkpoint.')
     p.add_argument('--base_model', default='gpt2', choices=['gpt2'],
                    help='Only gpt2 is supported (matches the production mode4 checkpoint).')
@@ -119,7 +120,7 @@ def main():
     print('\n--- Held-out test (early-stopping set) ---', flush=True)
     f1, acc = inference(tokenizer, best_model, valid_d, batch_size=args.valid_batch_size,
                         base_model=args.base_model)
-    print(f'finetune_test  acc={acc*100:.2f}  f1={f1*100:.2f}', flush=True)
+    print(f'synthetic_test  acc={acc*100:.2f}  f1={f1*100:.2f}', flush=True)
 
     if args.eval_csv:
         print('\n--- Realistic-eval (1:9, report only) ---', flush=True)

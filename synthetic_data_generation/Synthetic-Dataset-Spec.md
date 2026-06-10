@@ -2,14 +2,14 @@
 
 ## Generated files at a glance
 
-Running `python synthetic_data_generation/generate_synthetic.py --seed 42 --version 1` writes **four** CSVs to `data/synthetic/` (all `vN`-versioned). The generator first builds a population of synthetic patient *entities* (each a real-world person with a stable `entity_id`), emits one or more records per entity with realistic clerical corruptions (typos, name-token shuffles, missing SSN, address moves, …), and then assembles those records into the files below. All ground-truth provenance (`entity_id`, `case_type`, `corruptions_applied`, `split`) rides **inside** these files — there are no separate manifest files.
+Running `python synthetic_data_generation/generate_synthetic.py --seed 42 --version 2` writes **two** CSVs to `data/synthetic/` (all `vN`-versioned). The generator first builds a population of synthetic patient *entities* (each a real-world person with a stable `entity_id`), emits one or more records per entity with realistic clerical corruptions (typos, name-token shuffles, missing SSN, address moves, …), and then assembles those records into the files below. All ground-truth provenance (`entity_id`, `case_type`, `corruptions_applied`) rides **inside** these files — there are no separate manifest files.
 
-| File | Level | Rows (v1) | Match:non-match | Purpose |
-|---|---|---|---|---|
-| `finetune_train_v1.csv` | pair | ~30.9k | ~1:1.5 (balanced) | **Training set** for fine-tuning the mode4 checkpoint. Built **case-first**: deliberately balanced across the hard FQHC scenarios (§8) so the model learns the specific failure modes — SSN as decisive identity, cross-name-field token shuffles, household false-matches. |
-| `finetune_test_v1.csv` | pair | ~9.1k | ~1:1.5 | **Held-out test** for the fine-tune. **Entity-disjoint** from train (§10) — no entity appears in both — so it measures generalization, not memorization. |
-| `realistic_eval_v1.csv` | pair | 10k | 1:9 (realistic) | **Headline evaluation set** at realistic match prevalence. Built **entity-first**: pairs surface the way they would after blocking, with realistic class imbalance, so reported precision/recall reflects production conditions rather than the balanced training ratio. |
-| `blocking_eval_v1.csv` | record | ~16.7k | — | **Record-level** set (one row per record, *not* per pair) carrying the full cleaning-output schema (`_raw` + `_clean` + derived + `valid_record`) plus a ground-truth `entity_id`. Drop-in compatible with `MDM_Population_cleaned_v1.csv` so blocking/candidate-generation code runs unmodified, and the `entity_id` cluster label lets you measure blocking recall/precision. Drawn from the **same entities** as `realistic_eval_v1.csv` (§11.1). |
+| File | Level | Match:non-match | Purpose |
+|---|---|---|---|
+| `synthetic_train_v2.csv` | pair | ~1:1.5 (balanced) | **Training set** for fine-tuning the mode4 checkpoint. Built **hybrid** (§9): a realistic entity-first *bulk* (real missingness joint + multi-field corruptions, plus a dirty tail) with a budgeted minority of hard-scenario *overlays* (§8) so the model sees both the natural distribution and the specific failure modes — SSN as decisive identity, cross-name-field token shuffles, household false-matches. Drawn from the **train** entity partition. |
+| `synthetic_test_v2.csv` | pair | `--test-prevalence`, default 1:4 | **Honest evaluator.** Realistic-ish match prevalence + **hard negatives only** (no random strangers), the **same difficulty construction as train** (SSN bands + every named hard case + key-sharing negatives), realistic missingness + multi-corruption. **Entity-disjoint** from train (§10). 1:4 (not 1:9) keeps enough positives for stable per-`case_type` recall. |
+
+> **Design note (v0.5, 2026-06-09).** This supersedes the earlier four-file, case-first-dominant design. Two findings drove the change: (1) the old training corpus was unrealistically clean — 70% of positives had exactly one corruption and field presence was distorted by forced `ensure_*`/`force_full_ssn` calls — so the model learned brittle single-signal rules; (2) the old `realistic_eval` measured precision against uniformly-random strangers (0% shared DOB/address/phone/SSN), not the hard near-duplicates a matcher faces. The redesign makes realistic entity-first generation the backbone, demotes hard scenarios to budgeted overlays that **never** force field presence, adds a correlated **dirty tail**, and collapses output to the two files above. Goal: an AnyMatch **mode4** model robust enough on very dirty, sparse pairs to emit **silver labels** for unlabeled data.
 
 **Column conventions (pair files).** Model-input columns carry `_l`/`_r` suffixes and mirror the MDM-cleaned schema (consumed by `df_serializer` after `FEATURE_RENAMES`). Provenance columns use other naming so `df_serializer` skips them: `PATID_A`/`PATID_B`, `entity_id_a`/`entity_id_b` (ground-truth cluster ids), `case_type` (e.g. `M-SSN-04`), `corruptions_applied` (JSON list), and `label`. See §11 for the full layout.
 
@@ -312,7 +312,7 @@ For each pair of variants drawn from the same entity, apply corruptions. The cor
 - **Sex → use `by_ssn_dob` (~1.5%).** The `by_ssn` 8.5% is almost entirely the SSN-error artifact, not genuine same-person sex flips.
 - **DOB → use `by_ssn` (~13% differ).** `by_ssn_dob` is 100%-exact by construction and unusable here; within that 13%, off-by-one/transpose stay at their measured <0.1% (teaching-only, see §8 DOB note).
 
-**Corruption application model (locked 2026-05-28): independent per-field Bernoulli at the calibrated marginals.** Each field is corrupted independently at its P(differs) target above. We deliberately do **not** synthesize a field-to-field corruption *correlation*, because we have no measured joint-corruption distribution to calibrate one against and inventing it would distort the validated marginals (§12.7). Real "everything is a mess" co-occurrence is instead supplied explicitly by the heavy-drift scenarios (M-MIX-02, M-SSN-11) so the tail is represented without biasing the bulk. If QA later shows the realistic-eval is under-dispersed (too few multi-field-corrupted pairs), add a mild shared "messiness" multiplier as a v2 knob. SSN/last-4 are stable within a true cluster by construction (they're the cluster key), so SSN is never corrupted in match pairs except in the explicit M-SSN-08 / M-L4-03 drift scenarios.
+**Corruption application model (locked 2026-05-28): independent per-field Bernoulli at the calibrated marginals.** Each field is corrupted independently at its P(differs) target above. We deliberately do **not** synthesize a field-to-field corruption *correlation*, because we have no measured joint-corruption distribution to calibrate one against and inventing it would distort the validated marginals (§12.7). Real "everything is a mess" co-occurrence is instead supplied explicitly by the heavy-drift scenarios (M-MIX-02, M-SSN-11) so the tail is represented without biasing the bulk. **v0.5 update — the messiness multiplier is now ON (dirty tail).** The deferred "messiness" knob is enabled: a budgeted fraction (~15–25%) of positives draw a shared multiplier `m>1` that scales every field's P(differs) up *together*, so corruptions correlate and name+address+phone+DOB drift at once (5+ differing fields). The independent-Bernoulli marginals still govern the un-multiplied bulk; the multiplier only adds the heavy co-occurrence tail (validated by §12 check 8). SSN/last-4 are stable within a true cluster by construction (they're the cluster key), so SSN is never corrupted in match pairs except in the explicit M-SSN-08 / M-L4-03 drift scenarios.
 
 Corruption types (see §8 for the scenarios that combine these):
 - **Name corruptions:**
@@ -514,122 +514,100 @@ These are scenarios where the *correct* label is ambiguous or depends on the ope
 
 > **Policy register.** Every POL-* decision must be approved before generation. Default to excluding any case the team hasn't reviewed.
 
+### 8.4 Additional hard cases (v0.5)
+
+**Difficulty contract (v0.5).** Every named scenario below and in §8.1–§8.2 is filled to a **per-scenario quota** by the enumerated overlay, so the corpus contains **many pairs of each** (hundreds at the 40k scale), not one-offs. On top of that, the bulk supplies the realistic volume. Two global rules now govern *all* positives: (1) **no identical pairs** — every positive has ≥1 corruption; (2) **SSN-band quota** — ≤5% have matching full SSN on both sides (easy), ~15% match on last-4 only (full SSN absent), and **~80% have no usable SSN match** (at least one of full-SSN / last-4 missing or non-matching), forcing resolution on name+DOB+address+phone. Address line1 matches in only ~12–15% of positives (high-mobility FQHC population; cf. §5.8 line1-exact 28.8% measured on the SSN-having stable subpopulation).
+
+**Additional MATCH hard cases (added v0.5):**
+- **M-NAME-13 — First name to initial.** `JOHN` ↔ `J` (clerk recorded an initial). Counterpart to the middle-initial case.
+- **M-NAME-14 — Name truncation.** Long name cut by a field-length limit (`MASSIMILIANO` → `MASSIMILIAN`).
+- **M-NAME-15 — Cross-language given-name variant.** `GUILLERMO` ↔ `WILLIAM`, `JOSE` ↔ `JOSEPH`, `JESUS` ↔ `JESSE` (bilingual records); seeded via the nickname/equivalence pool.
+- **M-NAME-16 — Double-space / concatenation.** `DE LA CRUZ` ↔ `DELACRUZ`, `MARY ANN` ↔ `MARYANN`.
+- **M-ADDR-05 — Move within ZIP.** New street, same ZIP/city (very common churn).
+- **M-ADDR-06 — Directional / abbreviation drift.** `123 N MAIN ST` ↔ `123 NORTH MAIN STREET`.
+- **M-ZIP-01 — ZIP-only drift.** Same street, ZIP changed (data-entry or boundary correction).
+
+**Additional NON-MATCH hard cases (added v0.5):**
+- **NM-COMMON-06 — Same name + adjacent DOB.** Same first+last, DOB off by 1–3 days/years (looks like a DOB typo but is a different person).
+- **NM-HH-COUSIN — Cousins.** Same surname, same city/ZIP, different DOB and address.
+- **NM-SSN-06 — Same last-4 + same DOB, different name.** The collision-heavy `by_last4_dob` cluster (§5.7) — shared backup-SSN fragment is *not* identity.
+
+**Test set mirrors train (v0.5).** `synthetic_test` uses the **identical difficulty construction** as `synthetic_train` — the same SSN bands, the same enumerated hard-scenario coverage (so every named case above is *measured*, not just trained), and the same hard (key-sharing) negatives — drawn from **held-out entities** and at **`--test-prevalence` (default 1:4)**. The only differences from train are prevalence, the all-hard negatives (no easy anchor), and the disjoint entity pool. This makes the test both realistic (production-like prevalence + hard negatives) and diagnostic (per-`case_type` recall is readable because each scenario is present).
+
 **Default-exclude flag (locked 2026-05-28).** The first generation run gates stakeholder-sensitive scenarios behind `--include-policy-cases` (default **off**):
 
 - **Excluded by default** (flip the flag to include): **M-NOSSN-06** (DOB drift on a name-only anchor — borderline label) and **M-SEX-01** (sex disagreement, SSN-anchored — possibly ambiguous).
 - **Always excluded:** **POL-AMBIG-01** (twins sharing one SSN — no unambiguous teachable label), regardless of the flag.
 - **Included by default but tagged:** **POL-AMBIG-02** (same SSN, different name/sex → match=1) and **POL-AMBIG-03** (same name+DOB+address, no SSN → match=1). SSN-trumping and household-coincidence-as-match are explicit project goals, so these ship in the corpus; their `case_type` tag lets us audit or pull them after stakeholder review.
 
-## 9. Pair assembly
+## 9. Pair assembly (hybrid, v0.5)
 
-Two-stage build, sharing the same entity sampler (§6) and corruption pool (§7) but assembling pairs two different ways:
+One entity universe (§6), one corruption engine (§7). The universe is partitioned **entity-disjoint**
+into a train pool and a test pool (§10) up front; train pairs are built only from train entities and
+test pairs only from test entities. Both files are deterministic from `--seed`.
 
-**Assembly mechanism (locked 2026-05-28).**
-- **Fine-tune corpus → case-first (constructive).** Each §8 scenario has a recipe and a §9.1 quota; we construct exactly that many pairs by sampling the entity (or two entities), applying the scenario's *defining* transformation deterministically, then drawing the remaining fields' corruptions from the §7 marginals. Labels and `case_type` are known by construction (no fuzzy "dominant scenario" inference), and every ER-relevant case is guaranteed present at its budgeted count. This is why the fine-tune corpus ignores the realistic singleton-heavy K distribution — it builds the pairs it needs.
-- **Realistic-eval + the M-MIX bulk → entity-first (emergent).** Sample entities at realistic K / missingness / geo (§6, §7), apply §7-calibrated corruptions, form within-entity match pairs and cross-entity non-match pairs, and tag the nearest `case_type` post-hoc (best-effort, analysis-only). This reproduces the natural mixed-corruption distribution the realistic-eval needs.
+**Core rule (applies everywhere).** Field *presence* is always drawn from the real missingness joint
+(`missingness_patterns.top_patterns`, §5) and is **never** forced present — except for the single field a
+hard scenario is intrinsically about, and those scenarios are a budgeted minority. Field
+*agreement/corruption* is realistic and multi-field by default: every pair, positive **and** negative,
+passes through the §7 corruption engine so each side is independently messy, and a scenario only *adds*
+its one defining transformation on top. This is the fix for the old corpus where forced `ensure_*` /
+`force_full_ssn` calls and single-transformation scenarios made records too clean and field-rich.
 
-Both modes are deterministic from `--seed` and share the 15% entity hold-out (§10).
+**Two pair sources, mixed in both files:**
+- **Bulk (entity-first, ~75–85%).** Sample entities at realistic K / missingness / geo (§6).
+  *Positives* = within-entity variant pairs from the §7 engine (independent per-field corruptions at the
+  §5.8 marginals → naturally 2–3 simultaneous differences). *Negatives* = cross-entity pairs that
+  **share ≥1 strong blocking field** (surname / DOB / address / phone / last-4), each side independently
+  corrupted — i.e. blocking-survivor-like, never random strangers.
+- **Overlay (hard scenarios, ~15–25%).** The §8 catalog, refactored: start from a naturally-missing,
+  already-corrupted variant pair; apply only the scenario's defining transformation; `ensure_<field>`
+  only for that scenario's own field. Guarantees rare structural cases (name-order swaps, suffix-slot,
+  Jr/Sr, last-4 collisions, full-vs-last-4 SSN asymmetry) appear at a learnable count.
 
-### 9.1 Fine-tune corpus (balanced / oversampled)
+**Dirty tail (§7).** A budgeted fraction of positives (~15–25%) get a shared **messiness multiplier**
+that *correlates* corruptions so name + address + phone + DOB drift together (5+ differing fields),
+plus thin `N/A`-heavy records — the "everything is a mess at once" tail the marginals alone miss.
 
-Goal: each scenario above has enough examples for the model to internalize it.
+### 9.1 Training set — `synthetic_train_vN.csv`
 
-**Scale (locked 2026-05-28): 40,000 pairs**, match:non-match = **1:1.5** → **16,000 matches + 24,000 non-matches**. This is a deliberate *first cut*. Generation is deterministic and cheap (§14), so the workflow is **generate → fine-tune → read per-scenario realistic-eval metrics → scale up only the buckets that underperform**. The counts below are a starting allocation, not numbers to defend; the second pass re-weights from observed weakness, not from theory.
+Balanced **~1:1.5** match:non-match, hybrid bulk + overlay, drawn from the **train** entity partition.
+Scale is a parameter (`--train-pairs`, default ~40k); generation is cheap and deterministic, so the
+workflow stays **generate → fine-tune → read per-`case_type` test metrics → re-weight weak buckets**.
+The §8 bucket weights (No-SSN, Name-coupling, SSN, Last-4, drift, Mix for matches; Easy, Household,
+Common-name, SSN, Identity-fragment, Pediatric, Boundary for non-matches) govern the **overlay** slice;
+the bulk supplies the realistic backbone. Easy random negatives are a small minority — the non-match
+budget is dominated by hard, key-sharing negatives (the precise failure modes of an SSN-trumping model).
 
-#### Match budget (16,000)
+### 9.2 Test set — `synthetic_test_vN.csv` (honest evaluator)
 
-| Bucket | Weight (of M) | Pairs | # scenarios | ~Per-scenario |
-|---|---|---|---|---|
-| No-SSN-led (M-NOSSN-*) | 30% | 4,800 | 6 | ~800 |
-| Name-coupling (M-NAME-*) | 20% | 3,200 | 14 | ~230 |
-| SSN-led (M-SSN-*) | 15% | 2,400 | 11 | ~220 |
-| Last-4-led (M-L4-*) | 8% | 1,280 | 5 | ~256 |
-| Addr/DOB/Phone/Email/Sex/Ped drift | 20% | 3,200 | ~18 | ~180 |
-| Mixed / heavy-drift (M-MIX-*) | 7% | 1,120 | 3 | ~370 |
-
-#### Non-match budget (24,000)
-
-| Bucket | Weight (of NM) | Pairs | # scenarios | ~Per-scenario |
-|---|---|---|---|---|
-| Easy (NM-EASY-*) | 15% | 3,600 | 2 | ~1,800 |
-| Hard household (NM-HH-*) | 30% | 7,200 | 7 | ~1,030 |
-| Common-name (NM-COMMON-*) | 22% | 5,280 | 5 | ~1,056 |
-| SSN hard-negative (NM-SSN-*) | 13% | 3,120 | 5 | ~624 |
-| Identity-fragment (NM-IDF-*) | 12% | 2,880 | 4 | ~720 |
-| Pediatric NM (NM-PED-*) | 5% | 1,200 | 2 | ~600 |
-| Boundary (NM-BND-*) | 3% | 720 | 2 | ~360 |
-
-Hard negatives (household + common-name + SSN + identity-fragment = 77% of the NM budget) carry the bulk because they are the precise failure modes of an SSN-trumping model. Easy negatives stay substantial to anchor the "obviously different = 0" baseline. Per-scenario counts that exclude flag-gated scenarios (§8.3) are redistributed within their bucket.
-
-- **Case-first construction** fills each scenario's quota above directly and deterministically (see §9 assembly mechanism). Flag-gated scenarios (§8.3) contribute 0 unless enabled; their freed budget is redistributed within their bucket.
-- A minority slice of the M-MIX budget is drawn entity-first so the corpus also contains naturally-co-occurring multi-field corruption, not only single-scenario-constructed pairs.
-
-### 9.2 Realistic-eval set
-
-Goal: measure model performance as it will be observed in production.
-
-**Scale (locked 2026-05-28): 10,000 pairs**, match:non-match = **1:9 (10% positive)** as a realistic operating-prevalence assumption. **Measurement only — never used to train the matcher.**
-
-**Blocking-agnostic by design (clarified 2026-05-28).** This set — and the record-level `blocking_eval_v1.csv` it shares entities with (§11.1) — is **not** conditioned on, or pre-filtered by, any blocking key. Its distribution reflects the natural population (drawn from `synthetic_data_stats.json`), not the output of a particular blocker. That is deliberate: the blocking strategy, deterministic rules, and Fellegi–Sunter models are *downstream consumers we want to evaluate against this set independently*. Conditioning the eval on a blocking key would make it impossible to measure that blocker's own recall/precision (you can't score a filter on data it already filtered). So prevalence and negative-hardness here come from the population shape, not from assumptions about what survives blocking.
-
-- Built **entity-first** (§9 assembly mechanism) at the realistic K / missingness / geo distributions, with prevalence drawn from `synthetic_data_stats.json` (not the balanced §9.1 weights).
-- Each pair tagged with its nearest `case_type`; per-scenario metrics reported separately (so we see if SSN-trumping works on the realistic mix even if it's rare).
+Test prevalence (`--test-prevalence`, default 0.2 → 1:4), drawn from the **held-out** entity
+partition, **never used to train**. Negatives are **blocking-survivor-like only**: every non-match shares
+≥1 strong field (QA asserts this), so precision is measured against genuine near-duplicates rather than
+random strangers. Positives carry the same realistic missingness + multi-corruption + dirty tail as
+train. Each pair keeps its `case_type` tag for per-bucket metrics.
 
 ## 10. Train / test split
 
-- **Entity-disjoint** random split. Hold out **15%** of entities to *test* (locked 2026-05-28); all pairs derived from any held-out entity (within-entity or cross-entity) move to test if either side belongs to a held-out entity.
-- Both the fine-tune corpus and the realistic-eval set use the same entity hold-out so the same persons appear in test across both.
-- Splits are deterministic from `--seed`.
+- **Entity-disjoint.** A single entity universe is partitioned by a deterministic per-entity hash
+  (`test_entities`, seeded from `--seed`); no person appears in both files. Default hold-out fraction 15%.
+- Because train and test draw from disjoint entity pools, the test set measures generalization, not memorization.
+- Deterministic and byte-reproducible from `--seed`.
 
 ## 11. Output format
 
-CSV files under `data/synthetic/`. Filenames versioned: `vN` suffix to match the cleaning-output versioning convention.
+Two pair-level CSVs under `data/synthetic/`, `vN`-versioned:
 
 ```
-data/synthetic/finetune_train_v1.csv     # balanced corpus, train side of entity split   (pair-level)
-data/synthetic/finetune_test_v1.csv      # balanced corpus, test side                     (pair-level)
-data/synthetic/realistic_eval_v1.csv     # held-out realistic distribution                (pair-level)
-data/synthetic/blocking_eval_v1.csv      # realistic-distribution RECORDS (not pairs)     (record-level)
+data/synthetic/synthetic_train_vN.csv    # balanced ~1:1.5 hybrid corpus, train entity pool   (pair-level)
+data/synthetic/synthetic_test_vN.csv     # realistic prevalence, hard negatives, held-out pool (pair-level)
 ```
 
-Per-pair provenance (`case_type`, `corruptions_applied`, `entity_id_a/_b`) and per-entity ground truth (`entity_id`, `split`) ride **inside** the pair / record CSVs themselves (see the column layouts below), so no separate manifest files are emitted.
-
-### 11.1 Record-level blocking-eval file (`blocking_eval_v1.csv`)
-
-**Added 2026-05-28.** Everything else in §11 is pair-organized (`_l`/`_r` columns) for the matcher. The blocking strategy, however, operates on **individual records** — it ingests the patient table and emits candidate pairs. To test blocking we need a record-level file, not a pair file.
-
-**Purpose.** A realistic-distribution set of individual synthetic records (one row per record, *not* per pair) so the blocking strategy can be run end-to-end on synthetic data and its recall/precision measured against known ground truth before it ever touches real PHI.
-
-**Schema parity (hard requirement).** This file has the **exact same columns, in the same order, as the cleaning-pipeline output** (`MDM_Population_cleaned_v1.csv`) so that blocking code written against real data runs unmodified on it. That means it carries the full schema, not just the model-input subset:
-
-```
-# Identifier
-PATID
-# Raw (pre-cleaning, kept for audit)
-FirstNM_raw, LastNM_raw, MiddleNM_raw, SuffixNM_raw,
-BirthDT_raw, SSN_raw,
-AddressLine1_raw, AddressLine2_raw, CityNM_raw, ZipCD_raw, StateCD_raw, CountryNM,
-PrimaryPhoneNBR_raw, Phone01NBR_raw, Phone02NBR_raw, Phone03NBR_raw,
-Email_raw, SexAtBirthDSC_raw,
-# Cleaned
-FirstNM_clean, LastNM_clean, MiddleNM_clean, SuffixNM_clean,
-BirthDT_clean, SSN_clean, last_4_SSN,
-AddressLine1_clean, AddressLine2_clean, CityNM_clean,
-ZipCD_clean_base, ZipCD_clean_ext, StateCD_clean,
-PrimaryPhoneNBR_clean, Phone01NBR_clean, Phone02NBR_clean, Phone03NBR_clean,
-Email_clean, SexAtBirthDSC_clean,
-# Derived / auxiliary
-full_name_tokens, full_name_compact, Phones_set, Address_normalized,
-valid_record,
-# Ground-truth column (NOT in the real cleaning output — synthetic-only, for scoring blocking)
-entity_id
-```
-
-**How we satisfy the `_raw` columns.** §3 normally skips `_raw` because synthesis has no upstream noise to preserve. For this file we **populate `_raw` by copying the corresponding `_clean` value** (and `ZipCD_raw` from the recombined `ZipCD_clean_base`[+`-ext`], `BirthDT_raw` from `BirthDT_clean`, etc.). This is a faithful stand-in: a record whose raw value was already clean. Blocking keys are built from `_clean`/derived fields anyway, so the synthetic `_raw` content does not bias blocking — it exists purely for column-schema parity. `CountryNM` is filled with the modal real value (`US` — 58.9%; real data also carries `UNITED STATES` 26.8% and a literal `1` 13.2%, so a faithful fill samples from those three); `valid_record` is always `True` (§4 principle 2).
-
-**Relationship to `realistic_eval_v1.csv`.** Both are drawn from the **same entity/variant generator at the same realistic prevalence and share the same 15% entity hold-out** (§10). `blocking_eval_v1.csv` is the *record-level view* of those same entities; the `entity_id` column is the ground-truth cluster label. So you can: (a) run blocking on `blocking_eval_v1.csv` → candidate pairs, (b) score blocking recall/precision by checking each candidate pair's two `entity_id`s, and (c) feed surviving candidates into the matcher for an end-to-end blocking-+-matching evaluation that lines up with the pair-level `realistic_eval_v1.csv`. Scale: same record population that backs the 10k-pair realistic-eval (§9.2).
-
-**Dtype note.** Per the CLAUDE.md CSV dtype trap, ID-like columns (`SSN_clean`, `last_4_SSN`, `ZipCD_clean_base`, `PrimaryPhoneNBR_clean`, `Phone0[1-3]NBR_clean`, and their `_raw` mirrors) are emitted as strings; readers must force `dtype='string'` to preserve leading zeros.
+Both share the **identical column layout** (unchanged from prior versions): `PATID_A`/`PATID_B`, the
+model-input `_l`/`_r` columns mirroring the MDM-cleaned schema (consumed by `df_serializer` after the
+`utils/alliance_schema` rename → friendly mode4 attribute names), then provenance columns
+`label`, `case_type`, `corruptions_applied`, `entity_id_a`/`entity_id_b` (which `df_serializer` skips).
+No separate manifest or record-level/blocking files are emitted in v0.5.
 
 Pair-CSV column layout. Every column intended for the model has `_l`/`_r` suffix and mirrors the MDM-cleaned schema so the same `FEATURE_RENAMES + derive` pipeline runs. Provenance / bookkeeping columns use other naming to stay out of `df_serializer`:
 
@@ -673,13 +651,16 @@ entity_id_a, entity_id_b  # ground-truth cluster ids (§4 principle 9); drive th
 
 Assertions the generator must satisfy and a notebook verifies:
 
-1. **Schema parity.** Synthetic pair-CSV columns match `MDM_Population_cleaned_v1.csv` schema after `_l`/`_r` un-suffixing. **Additionally, `blocking_eval_v1.csv` (§11.1) must match the cleaning-output schema column-for-column and in-order** (raw + clean + derived + `valid_record`, plus the synthetic-only `entity_id` ground-truth column); assert exact column-name/order equality against a real cleaned-file header.
+1. **Schema parity.** Both `synthetic_train_vN.csv` and `synthetic_test_vN.csv` carry the identical pair-CSV column layout (§11); model columns match the `MDM_Population_cleaned_v1.csv` schema after `_l`/`_r` un-suffixing, and every `_l`/`_r` column maps to a friendly mode4 attribute via `utils/alliance_schema.prep_paired_df` (no column falls outside the schema).
 2. **Value conventions.** All names uppercase ASCII; no diacritics; ZIPs are 5-digit strings; SSNs are 9-digit strings with no junk patterns.
 3. **`valid_record=True`** on every emitted record.
 4. **Label / case agreement.** Every `case_type` in `M-*` has `label=1`; every `NM-*` has `label=0`.
-5. **Entity disjointness.** No `entity_id` appears in both train and test.
+5. **Entity disjointness.** No `entity_id` appears in both `synthetic_train` and `synthetic_test`.
 6. **No PHI leakage.** No row matches anything in real `MDM_Population_cleaned_v1.csv` (a hash-set check on a few high-cardinality fields). The point of synthesis is that real persons cannot be recovered.
-7. **Distribution sanity vs `synthetic_data_stats.json`.** The *realistic-eval* set's per-record marginals fall within ±5 absolute percentage points of the measured §5 values for each of:
+7. **Realistic missingness (v0.5 — the key fix).** Per-field **presence**, measured by stacking both `_l` and `_r` sides of every pair, falls within **±3** absolute percentage points of the measured §5 marginals for each field below. This is the check the old corpus failed (forced `ensure_*` over-populated SSN/middle/email).
+8. **Multi-corruption profile (v0.5 — the other key fix).** Among positives, the distribution of *differing-field count* must have a real heavy tail — mean ≈ 2–3 differing fields, **not** a 70% one-corruption spike — with a non-trivial ≥5-field "dirty tail" share. Validate against the §5.8 within-cluster differ profile.
+9. **Hard negatives only in test.** **100%** of `synthetic_test` non-match pairs share ≥1 strong blocking field (surname / DOB / address / phone / last-4). No random-stranger negatives in the test set.
+10. **Distribution sanity vs `synthetic_data_stats.json`.** Per-record marginals (stacked sides) fall within ±3 absolute percentage points of the measured §5 values for each of:
     - `FirstNM_clean` / `LastNM_clean` / `BirthDT_clean` presence (~99% expected).
     - `MiddleNM_clean` presence (~19%) and pct-single-initial (~97% of present).
     - `SSN_clean` presence (~21%), `last_4_SSN` presence (~36%), `no_full_ssn_but_last4_present_pct` (~14%).
