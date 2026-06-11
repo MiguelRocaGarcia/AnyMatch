@@ -57,7 +57,6 @@ def parse_args():
     p.add_argument('--pairs_parquet', required=True, help='Blocking output parquet with PATID_A / PATID_B.')
     p.add_argument('--ckpt_dir', default='saved_models/anymatch_alliance_ft_v2', help='Trained checkpoint dir.')
     p.add_argument('--output_csv', required=True, help='Incremental predictions CSV (appended to; resumable).')
-    p.add_argument('--log_file', default=None, help='Log file path (default: <output_csv>.log).')
     p.add_argument('--chunk_size', type=int, default=2000, help='Pairs scored + flushed to disk per chunk.')
     p.add_argument('--batch_size', type=int, default=32, help='Model forward-pass batch size.')
     p.add_argument('--max_len', type=int, default=1024, help='GPT-2 context cap; nothing should be filtered.')
@@ -66,13 +65,13 @@ def parse_args():
     return p.parse_args()
 
 
-def setup_logging(log_file):
+def setup_logging():
+    """Log to the terminal (stdout) only — no log file is written."""
     logger = logging.getLogger('predict_full')
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
     fmt = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
     sh = logging.StreamHandler(sys.stdout); sh.setFormatter(fmt); logger.addHandler(sh)
-    fh = logging.FileHandler(log_file); fh.setFormatter(fmt); logger.addHandler(fh)
     return logger
 
 
@@ -110,8 +109,7 @@ def main():
     args = parse_args()
     assert os.path.exists('loo.py'), (
         f'Run from the AnyMatch/ directory (cwd={os.getcwd()!r}).')
-    log_file = args.log_file or (args.output_csv + '.log')
-    log = setup_logging(log_file)
+    log = setup_logging()
 
     log.info('=== AnyMatch full batched inference ===')
     log.info(f'checkpoint={args.ckpt_dir}  mode={args.serialization_mode}  '
