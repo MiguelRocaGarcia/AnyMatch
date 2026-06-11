@@ -1,8 +1,8 @@
-# python predict_alliance_full.py \
-#       --records_parquet data/alliance/MDM_Population_cleaned_v3_2026_06_11.parquet \
-#       --pairs_parquet   data/alliance/candidate_pairs_v4_2026_06_11.parquet \
-#       --ckpt_dir        saved_models/anymatch_alliance_ft_v2 \
-#       --output_csv      data/alliance/anymatch_predictions_full.csv \
+# python predict_alliance_full.py `
+#       --records_parquet data/alliance/MDM_Population_cleaned_v3_2026_06_11.parquet `
+#       --pairs_parquet   data/alliance/candidate_pairs_v4_2026_06_11.parquet `
+#       --ckpt_dir        saved_models/anymatch_alliance_ft_v2 `
+#       --output_csv      data/alliance/anymatch_predictions_full.csv `
 #       --chunk_size 2000 --batch_size 32
 
 # Windows-VM fix: this conda env links two OpenMP runtimes (PyTorch's

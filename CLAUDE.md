@@ -13,8 +13,10 @@ A **patched fork** of [Jantory/anymatch](https://github.com/Jantory/anymatch) (Z
 1. **Data prep** (local): `data/preprocess.ipynb` consumes `data/raw/` → produces `data/prepared/<dataset>/{train,valid,test}.csv` + `attr_*.csv`.
 2. **Train** (Colab Pro A100): `anymatch_training.ipynb` runs `loo.py --leaved_dataset_name none` on all 9 datasets; ~30–60 min; checkpoint backed up to Drive at `MyDrive/AnyMatch/checkpoints/anymatch_all9_gpt2_mode4/`. (The previous `anymatch_all9_gpt2/` mode1 checkpoint is kept around for A/B comparison.)
 3. **Fine-tune** (Colab Pro A100): `anymatch_finetuning.ipynb` runs `finetune_alliance.py`, which **resumes from** the all9 mode4 checkpoint and continues training on the synthetic corpus (`data/synthetic/synthetic_train_v2.csv`, early-stopped on `synthetic_test_v2.csv`); ~10–25 min; checkpoint backed up to Drive at `MyDrive/AnyMatch/checkpoints/anymatch_alliance_ft_v2/`. This is the *sequential* (not joint-mix) fine-tune — gentle LR + early stop on the entity-disjoint test.
-4. **Sanity-check inference** (local): `anymatch_synthetic_inference.ipynb` renames the generated `data/synthetic/synthetic_test_v2.csv` (the realistic-distribution evaluator) to the friendly schema (`utils/alliance_schema.prep_paired_df`) and scores it.
-5. **Real inference** (local for small batches, Colab for full 212k): `anymatch_alliance_inference.ipynb` joins the blocking output `data/alliance/candidate_pairs_*.parquet` with `data/alliance/MDM_Population_cleaned_v1.csv`, filters `valid_record=True`, and scores via `predict_alliance.py`.
+4. **Sanity-check inference** (local): `anymatch_synthetic_inference.ipynb` renames the generated `data/synthetic/synthetic_test_v2.csv` (the realistic-distribution evaluator) to the friendly schema (`utils/alliance_schema.prep_paired_df`) and scores it **inline** (the fine-tuned checkpoint ships only `tokenizer.json`, which the slow `GPT2Tokenizer` in `predict_alliance.py` can't load).
+5. **Real inference** — two paths, both **inline** (not via `predict_alliance.py`):
+   - *Small / sanity batches* (local notebook): `anymatch_alliance_inference.ipynb` joins the blocking output `data/alliance/candidate_pairs_v4_2026_06_11.parquet` with the per-record `data/alliance/MDM_Population_cleaned_v3_2026_06_11.parquet` (**both parquet now**), filters `valid_record=True`, scores `N_PAIRS` pairs inline, and shows diagnostics.
+   - *Full population* (CLI, multi-day): `predict_alliance_full.py` — resumable, batched, parquet in → incremental single CSV out, terminal progress logs. This is the production scoring path.
 
 ## Patched files — do not revert
 
@@ -27,7 +29,8 @@ A **patched fork** of [Jantory/anymatch](https://github.com/Jantory/anymatch) (Z
 
 ## New files (not in upstream)
 
-- `predict_alliance.py` — inference CLI. Reads any CSV with `*_l` / `*_r` columns + optional `label`, writes the same CSV + `pred` / `match_prob`. Other columns (e.g. `PATID_A`, `PATID_B`) ride through untouched because `df_serializer` only consumes `_l` / `_r`-suffixed columns.
+- `predict_alliance.py` — **legacy** inference CLI. Reads any CSV with `*_l` / `*_r` columns + optional `label`, writes the same CSV + `pred` / `match_prob`. Other columns (e.g. `PATID_A`, `PATID_B`) ride through untouched because `df_serializer` only consumes `_l` / `_r`-suffixed columns. Uses the **slow** `GPT2Tokenizer`, so it **cannot load the fine-tuned checkpoint** (which ships only `tokenizer.json`) — use it only with the base mode4 checkpoint / legacy CSVs.
+- `predict_alliance_full.py` — **production scoring CLI** for the full population. Reads the per-record MDM **parquet** + the candidate-pairs **parquet** (point each at the *file*, not a directory — pyarrow scans directories as datasets and chokes on stray files), filters `valid_record=True` on both sides, sorts deterministically, and scores in chunks. **Resumable:** after each `--chunk_size` chunk it appends to the one `--output_csv` and `fsync`s, so a crash/restart (it's a multi-day run) resumes from exactly the next unscored pair — just re-run the same command. Output columns: `PATID_A, PATID_B, pred, match_prob` (lean; join back to records on PATID). Scores **inline** with `GPT2TokenizerFast` (falls back to base `gpt2` BPE), device `auto` (CUDA→MPS→CPU; pass `--device cuda` on a GPU VM). Progress logs go to **stdout only** (no log file): per-chunk `done/total (%)`, remaining, rate, ETA, finish estimate.
 - `finetune_alliance.py` — **sequential fine-tune** CLI. Resumes from a checkpoint dir (`GPT2ForSequenceClassification.from_pretrained(base_checkpoint)`), reads the synthetic `_l`/`_r` pair CSVs, renames technical→friendly via `utils/alliance_schema`, serializes mode4, trains via the existing `train()`, early-stops on the entity-disjoint test, and reports a final realistic-eval (1:9) F1. Gentle defaults: `--lr 1e-5 --epochs 10 --patience 3`.
 - `utils/alliance_schema.py` — **single source of truth** for the AllianceChicago feature schema. `CANONICAL_RENAMES` (technical MDM column → clean English attribute name; full spec §2: three separate name fields + `suffix`, `address2`, `ssn`, `ssn4`, `email`), plus `id_str_dtypes`, `serialize_set_field`, `prep_record_df` (per-record path for alliance inference), `prep_paired_df` (already-paired path for synthetic inference + fine-tune training). **Both inference notebooks and `finetune_alliance.py` import this** so train and serve serialize identical attribute names — drift here silently hurts accuracy.
 - `anymatch_training.ipynb`, `anymatch_finetuning.ipynb`, `anymatch_synthetic_inference.ipynb`, `anymatch_alliance_inference.ipynb` — the four end-to-end notebooks.
@@ -91,14 +94,29 @@ python predict_alliance.py \
     --input_csv <pairs>.csv --output_csv <predictions>.csv --batch_size 32
 ```
 
-`predict_alliance.py`'s `--serialization_mode` defaults to `mode1` for backward compatibility — always pass `--serialization_mode mode4` explicitly when using the mode4 checkpoint.
+`predict_alliance.py`'s `--serialization_mode` defaults to `mode1` for backward compatibility — always pass `--serialization_mode mode4` explicitly when using the mode4 checkpoint. **Note:** `predict_alliance.py` can't load the fine-tuned checkpoint (slow tokenizer vs `tokenizer.json`) — for the fine-tuned model use the inline notebook or `predict_alliance_full.py`.
+
+Score the **full population** with the fine-tuned checkpoint (resumable, parquet in, multi-day):
+
+```sh
+python predict_alliance_full.py \
+    --records_parquet data/alliance/MDM_Population_cleaned_v3_2026_06_11.parquet \
+    --pairs_parquet   data/alliance/candidate_pairs_v4_2026_06_11.parquet \
+    --ckpt_dir        saved_models/anymatch_alliance_ft_v2 \
+    --output_csv      data/alliance/anymatch_predictions_full.csv \
+    --chunk_size 2000 --batch_size 32 --device cuda
+```
+
+Re-run the **same command** to resume after a crash (it counts rows already in `--output_csv`). Drop `--device cuda` to auto-pick (CPU is ~15 h for the v4 drop). Logs to stdout only.
 
 ## Gotchas (learned the hard way)
 
-- **CSV dtype trap.** When reading any cleaned MDM file, force-cast ID columns to `'string'` via `pd.read_csv(..., dtype={'SSN_clean': 'string', 'last_4_SSN': 'string', 'ZipCD_clean_base': 'string', 'PrimaryPhoneNBR_clean': 'string', ...})`. Without this, pandas infers float64 because of NaN, prints `358467965.0` in the prompt, and strips leading zeros — destroys exact-match signal.
+- **ID dtype trap.** When reading any cleaned MDM file, force ID columns to `'string'`. For CSV use `pd.read_csv(..., dtype=id_str_dtypes(header))`; for **parquet** (no `dtype=` arg) cast after read: `for col, dt in id_str_dtypes(df.columns).items(): df[col] = df[col].astype(dt)`. Without this, pandas infers float64 because of NaN, prints `358467965.0` in the prompt, and strips leading zeros — destroys exact-match signal. `utils/alliance_schema.id_str_dtypes(columns)` returns the dtype map for whichever ID columns are present.
+- **Parquet path must be a file, not a directory.** `pd.read_parquet(dir)` makes pyarrow treat the directory as a dataset and read *every* file in it, failing on any non-parquet sibling (`Parquet magic bytes not found in footer`). Point `--records_parquet` / `--pairs_parquet` (and the notebook paths) at the exact `.parquet` file.
+- **OpenMP duplicate-runtime crash (Windows).** On the AllianceChicago Windows VM, torch's `libiomp5md.dll` + LLVM's `libomp.dll` (from tokenizers/transformers) both load and abort the process with `OMP: Error #15 … ExitCode 3` (kernel dies on the inference cell). Fix: set `os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'` **before** the first torch/pandas/numpy import. Already baked into `predict_alliance_full.py` and both inference notebooks (top of cell 1).
 - **Per-side date conversion bug.** Do `pd.to_datetime(...).dt.strftime(...)` **once on the source DataFrame** before joining, not separately on each `_l` / `_r` slice. The latter triggers Series index alignment and silently nulls one side.
 - **`predict_alliance.py` requires the AnyMatch directory as cwd** (relative imports of `data`, `utils`, `model`). Notebooks assert `os.path.exists('loo.py')` to enforce this.
-- **No MPS on Apple Silicon.** `utils/train_eval.py::predict` only checks `torch.cuda.is_available()`. Inference on Mac falls back to CPU (~700 ms/pair). Don't waste time looking for an MPS path — at the scale this notebook runs, it doesn't matter; full 212k-pair runs should go to Colab GPU.
+- **Device selection.** The shared `utils/train_eval.py::predict` only checks `torch.cuda.is_available()` (CUDA-or-CPU). The newer inline scorers — both inference notebooks and `predict_alliance_full.py` — add their own `pick_device()` (CUDA → Apple-Silicon MPS → CPU, with a CPU fallback if an MPS op is unimplemented), so don't route through the shared `predict()` if you want MPS. CPU is ~270 ms/pair; the full population (~205k valid pairs in the v4 drop) is ~15 h on CPU, minutes-to-hours on a GPU — pass `--device cuda` when a GPU is available.
 - **PHI.** Real patient data only on Colab Pro / HIPAA-tier compute, never raw rows in chat tools. The `valid_record=True` filter must run upstream — the model produces confident garbage on rows the cleaning step flagged invalid.
 
 ## Layout sketch
@@ -106,7 +124,8 @@ python predict_alliance.py \
 ```
 loo.py                 # base training entry point (patched; trains GPT-2 on the 9 datasets)
 finetune_alliance.py   # sequential fine-tune CLI (new; resumes from checkpoint, synthetic corpus)
-predict_alliance.py    # inference CLI (new)
+predict_alliance.py    # legacy CSV inference CLI (new; base checkpoint only — slow tokenizer)
+predict_alliance_full.py # production scoring CLI (new; resumable, batched, parquet in -> incremental CSV)
 inference.py           # upstream evaluation script (kept for reference)
 model.py, data.py      # model + dataset class loaders (unchanged)
 utils/
@@ -117,7 +136,7 @@ data/
   raw/<dataset>/       # 8 Magellan deepmatcher zips + WDC
   prepared/<dataset>/  # output of preprocess.ipynb
   synthetic/           # synthetic_{train,test}_v2 (generated; v0.5 hybrid)
-  alliance/            # candidate_pairs_*.parquet, MDM_Population_cleaned_v1.csv
+  alliance/            # candidate_pairs_v4_*.parquet, MDM_Population_cleaned_v3_*.parquet (both parquet)
 docs/
   Data-Cleaning-Guide.md   # MDM cleaning rules (drives synthetic-data conventions)
 synthetic_data_generation/
@@ -127,6 +146,7 @@ synthetic_data_generation/
   generate_synthetic.py     # the generator (byte-reproducible from --seed)
   qa_checks.py              # asserts the §12 structural checks
 anymatch_training.ipynb / anymatch_finetuning.ipynb            # Colab: base train, then fine-tune
-anymatch_synthetic_inference.ipynb / anymatch_alliance_inference.ipynb  # local inference
+anymatch_synthetic_inference.ipynb / anymatch_alliance_inference.ipynb  # local inline inference (synthetic eval / small real batches)
+predict_alliance_full.py  # full-population production scoring (see above)
 saved_models/          # trained checkpoints (download from Drive)
 ```
