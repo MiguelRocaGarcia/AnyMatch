@@ -173,6 +173,15 @@ def run(out: Path, v: int, stats: dict):
         return n + (1 if set(pl) & set(pr) else 0)
     sh = neg.apply(n_shared, axis=1)
     warn((sh >= 2).mean() >= 0.30, f"negatives sharing >=2 strong keys = {(sh>=2).mean():.1%} (target ~35-40%)")
+    # No negative may be the same-person signature: first+last+DOB+address all equal
+    # is a MATCH by policy, so labeling such a pair 0 is direct label noise (the
+    # LAURA-MARTINEZ false-positive class). Enforced over BOTH files.
+    allneg = allpairs[allpairs["label"] == 0]
+    sig = allneg.apply(lambda r: all((str(r[f"{c}_l"]) == str(r[f"{c}_r"]) and str(r[f"{c}_l"]) != "")
+                                     for c in ("FirstNM_clean", "LastNM_clean",
+                                               "BirthDT_clean", "AddressLine1_clean")),
+                       axis=1).sum()
+    check(sig == 0, f"zero negatives agreeing on all of first+last+DOB+address (got {sig})")
 
     print("\n== §12.9 hard negatives (test) ==")
     teneg = test[test["label"] == 0]

@@ -1908,8 +1908,78 @@ def _run_methods(gen, pb, lib, methods, count, enforce_band=None):
         recA, recB = pb.emit_record(cA, eidA), pb.emit_record(cB, eidB)
         if enforce_band is not None:
             enforce_positive(gen, recA, recB, enforce_band)
+        elif label == 0:
+            # Scenario negatives differ on >=1 identity field by construction, but a
+            # coincidental shared common name could still complete the four-field
+            # same-person signature — break it so no negative is labeled against the
+            # policy (first+last+DOB+address agree => match).
+            break_identity_collision(gen, recA, recB, locked=())
         rows.append(pair_row(recA, recB, label, case, corr))
     return rows
+
+
+# The four strong identity fields whose JOINT agreement the project treats as a
+# match by policy: if first name, last name, DOB AND address-line all agree, the
+# pair is the same person. A hard NEGATIVE must therefore never agree on all four
+# at once — that vector is indistinguishable from the name+DOB+address positives
+# (M-NOSSN-*, M-ADDR-*, POL-AMBIG-03), so labeling it a non-match is direct label
+# noise (the LAURA-MARTINEZ false-positive class). `address` here is AddressLine1,
+# the model-visible `address` attribute (see utils/alliance_schema).
+IDENTITY_FOUR = [
+    ("firstname", "FirstNM_clean"),
+    ("lastname",  "LastNM_clean"),
+    ("dob",       "BirthDT_clean"),
+    ("addr",      "AddressLine1_clean"),
+]
+
+
+def identity_four_collide(recA: dict, recB: dict) -> bool:
+    """True iff first name, last name, DOB and address-line are all PRESENT and
+    equal on both records (the same-person signature)."""
+    for _, f in IDENTITY_FOUR:
+        a, b = recA.get(f), recB.get(f)
+        if not a or not b or a != b:
+            return False
+    return True
+
+
+def break_identity_collision(gen: Generator, recA: dict, recB: dict, locked) -> str | None:
+    """Guarantee a NEGATIVE is not the same-person signature: if recA/recB agree on
+    all four strong identity fields (first, last, DOB, address), force ONE field
+    NOT in `locked` to differ on recB. `locked` holds the keys a caller
+    deliberately shared (e.g. force_shared_keys' blocking keys) so we never undo a
+    real blocking collision — we only break the *coincidental* fourth agreement.
+    Returns the field key changed, or None if no change was needed."""
+    if not identity_four_collide(recA, recB):
+        return None
+    locked = set(locked)
+    for key, field in IDENTITY_FOUR:
+        if key in locked:
+            continue
+        if key == "firstname":
+            sex = recB.get("SexAtBirthDSC_clean")
+            new = gen.sample_first(sex)
+            for _ in range(20):
+                if new != recB["FirstNM_clean"]:
+                    break
+                new = gen.sample_first(sex)
+            recB["FirstNM_clean"] = new
+        elif key == "lastname":
+            new = gen.sample_last()
+            for _ in range(20):
+                if new != recB["LastNM_clean"]:
+                    break
+                new = gen.sample_last()
+            recB["LastNM_clean"] = new
+        elif key == "dob":
+            y, m, d = map(int, recB["BirthDT_clean"].split("-"))
+            ny = min(max(y + gen.rng.choice([-9, -7, 7, 9]), 1900), 2026)
+            recB["BirthDT_clean"] = date(ny, m, d).isoformat()
+        else:  # addr (last resort; reachable only if first+last+dob were all locked)
+            recB["AddressLine1_clean"] = gen.sample_street_address()
+        recompute_derived(recB)
+        return key
+    return None
 
 
 def force_shared_keys(gen: Generator, recA: dict, recB: dict, n_keys: int) -> str:
@@ -1953,6 +2023,11 @@ def force_shared_keys(gen: Generator, recA: dict, recB: dict, n_keys: int) -> st
             existing = recB["Phones_set"].split() if recB["Phones_set"] else []
             recB["Phones_set"] = phones_set([recA["Phones_set"].split()[0]] + existing)
     recompute_derived(recB)
+    # A distinct person can still COINCIDENTALLY match the un-forced identity fields
+    # (most often a shared common first name on top of forced last+DOB+address). If
+    # that lands on all four of first/last/DOB/address, the negative becomes the
+    # same-person signature — break it on a non-forced field so it isn't label noise.
+    break_identity_collision(gen, recA, recB, locked=keys)
     return "NM-HARD-" + "+".join(sorted(keys)).upper()
 
 

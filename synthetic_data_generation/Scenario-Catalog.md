@@ -458,6 +458,16 @@ then each side independently corrupted. The `case_type` records which keys colli
 so any field map reduces to: the named keys are `=`, everything else differs. These are the bulk of the
 negative budget — the realistic "survived blocking but isn't a match" population.
 
+**Same-person-signature guard (policy invariant).** A distinct person can still *coincidentally* match an
+un-forced identity field — most often a shared **common first name** on top of forced last+DOB+address. If
+that lands on **all four** of `fst`+`lst`+`dob`+`ad1`, the negative becomes byte-identical to the
+name+DOB+address positives (M-NOSSN-*, M-ADDR-*, POL-AMBIG-03), so labeling it `0` is direct **label noise**.
+Per project policy *first+last+DOB+address agree ⇒ match*, so `break_identity_collision` runs after every
+negative is built (inside `force_shared_keys` and, defensively, in `_run_methods` for any `label=0`
+scenario) and forces **one non-forced** identity field on B to differ (priority `fst`→`lst`→`dob`→`ad1`,
+never undoing a deliberately-shared blocking key). Enforced as a hard QA invariant: **zero negatives may
+agree on all of first+last+DOB+address** (`qa_checks.py` §12.8b).
+
 ---
 
 # Generation proportions (what actually drives sampling)

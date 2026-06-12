@@ -440,7 +440,13 @@ its one defining transformation on top. This is the fix for the old corpus where
   blocking field** (surname / DOB / address / phone / last-4), each side independently corrupted — i.e.
   blocking-survivor-like, never random strangers (`NM-HARD-*`). *Catalog negatives* = the §8 NM scenarios
   (household, common-name, identity-fragment, etc.). Bulk negatives are correct by construction (two
-  genuinely different people), so heavy drift on them is always fine.
+  genuinely different people), so heavy drift on them is always fine — **with one policy guard:** a
+  negative may never agree on **all four** of first+last+DOB+address. That vector is the same-person
+  signature (identical to the M-NOSSN-* / M-ADDR-* / POL-AMBIG-03 positives), so labeling it `0` is direct
+  label noise. A distinct person can still *coincidentally* match an un-forced field (most often a shared
+  common first name on top of forced last+DOB+address), so `break_identity_collision` runs after every
+  negative and forces one non-forced identity field to differ (priority first→last→DOB→address, never
+  undoing a deliberately-shared blocking key). Enforced as a hard QA invariant (§12).
 
 **Removed in v0.6 — entity-first bulk positives + dirty tail.** The v0.5 bulk *positives* and the
 messiness multiplier transplanted `by_ssn`-calibrated drift onto no-SSN pairs with no protected anchor,
@@ -538,6 +544,7 @@ Assertions the generator must satisfy and a notebook verifies:
 7. **Realistic missingness (v0.5 — the key fix).** Per-field **presence**, measured by stacking both `_l` and `_r` sides of every pair, falls within **±3** absolute percentage points of the measured §5 marginals for each field below. This is the check the old corpus failed (forced `ensure_*` over-populated SSN/middle/email).
 8. **Multi-corruption profile.** Among positives, the distribution of *differing-field count* must have a real spread — mean ≈ 2–3 differing fields, **not** a 70% one-corruption spike. The heavy co-occurrence now comes from the §8 heavy-drift catalog cases (M-MIX-02, M-SSN-11) plus realistic §7 background drift on every case, **not** from a messiness multiplier (removed in v0.6). **Anchor-survival (v0.6):** every positive must retain ≥1 shared strong signal (matching SSN / last-4 / address / phone, or exact-or-near name + DOB) — no positive drifts to zero residual signal.
 9. **Hard negatives only in test.** **100%** of `synthetic_test` non-match pairs share ≥1 strong blocking field (surname / DOB / address / phone / last-4). No random-stranger negatives in the test set.
+9b. **No same-person-signature negatives (v0.6.1).** **Zero** negatives (across train **and** test) may agree on **all four** of first+last+DOB+address. That vector is a match by project policy (identical to the M-NOSSN-* / M-ADDR-* / POL-AMBIG-03 positives), so a `label=0` there is label noise. `break_identity_collision` prevents it at generation; `qa_checks.py` §12.8b hard-fails if any slip through. (The mirror of the §12.8 "zero identical positives outside POL-AMBIG-03" rule.)
 10. **Distribution sanity vs `synthetic_data_stats.json`.** Per-record marginals (stacked sides) fall within ±3 absolute percentage points of the measured §5 values for each of:
     - `FirstNM_clean` / `LastNM_clean` / `BirthDT_clean` presence (~99% expected).
     - `MiddleNM_clean` presence (~19%) and pct-single-initial (~97% of present).
