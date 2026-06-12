@@ -152,13 +152,16 @@ def run(out: Path, v: int, stats: dict):
     any_ssn = (both_eq(pos, "SSN_clean") | both_eq(pos, "last_4_SSN")).mean()
     no_ssn = 1 - any_ssn
     addr = both_eq(pos, "AddressLine1_clean").mean()
-    ident = pos.apply(lambda r: all((str(r[f"{c}_l"]) == str(r[f"{c}_r"]))
-                                     for c in ("FirstNM_clean", "LastNM_clean", "BirthDT_clean", "AddressLine1_clean")),
-                      axis=1).sum()
-    check(ident == 0, f"zero identical positives (got {ident})")
+    # POL-AMBIG-03 deliberately agrees on name+DOB+address (no SSN) — that strong-field
+    # agreement IS the scenario — so it is exempt from the no-identical rule.
+    non_pol = pos[pos["case_type"] != "POL-AMBIG-03"]
+    ident = non_pol.apply(lambda r: all((str(r[f"{c}_l"]) == str(r[f"{c}_r"]))
+                                        for c in ("FirstNM_clean", "LastNM_clean", "BirthDT_clean", "AddressLine1_clean")),
+                          axis=1).sum()
+    check(ident == 0, f"zero identical positives outside POL-AMBIG-03 (got {ident})")
     warn(full_ssn <= 0.07, f"full-SSN-match positives = {full_ssn:.1%} (target <=5%)")
     warn(no_ssn >= 0.72, f"no-usable-SSN positives = {no_ssn:.1%} (target ~80%)")
-    warn(addr <= 0.20, f"address-match positives = {addr:.1%} (target ~10-15%, 'almost never')")
+    warn(addr <= 0.34, f"address-match positives = {addr:.1%} (target ~25-30%, per §5.8 line1_exact=28.8%)")
 
     print("\n== §12.8b negative difficulty (multi-key) ==")
     neg = train[train["label"] == 0]

@@ -19,10 +19,10 @@ held-out test, to minimise catastrophic forgetting.
 Example (run from the AnyMatch/ directory):
     python finetune_alliance.py \\
         --base_checkpoint saved_models/anymatch_all9_gpt2_mode4 \\
-        --train_csv data/synthetic/synthetic_train_v2.csv \\
-        --valid_csv data/synthetic/synthetic_test_v2.csv \\
-        --eval_csv  data/synthetic/synthetic_test_v2.csv \\
-        --save_model_path saved_models/anymatch_alliance_ft_v2 \\
+        --train_csv data/synthetic/synthetic_train_v3.csv \\
+        --valid_csv data/synthetic/synthetic_test_v3.csv \\
+        --eval_csv  data/synthetic/synthetic_test_v3.csv \\
+        --save_model_path saved_models/anymatch_alliance_ft_v3 \\
         --serialization_mode mode4
 """
 import argparse

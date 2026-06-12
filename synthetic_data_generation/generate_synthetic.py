@@ -89,6 +89,63 @@ AREA_CODES_BY_REGION = {
 }
 DEFAULT_AREA_CODES = ["773", "312", "708", "847", "630"]
 
+# Vietnamese given/family name pools for the M-NAME-05 name-order-swap scenario.
+# `given` lands in first_name on A / last_name on B (and vice-versa for `fam`),
+# so the same human's tokens appear in swapped slots — the signal the case teaches.
+# Pools keep full_name_tokens identical on both sides (QA §12.8b invariance).
+VIET_GIVEN = [
+    "VAN NAM", "THI MAI", "MINH ANH", "DUC ANH", "THI HOA", "THI LAN",
+    "QUOC BAO", "VAN HUNG", "THI HUONG", "NGOC LAN", "VAN DUNG", "THI THUY",
+]
+VIET_FAMILY = [
+    "NGUYEN", "TRAN", "LE", "PHAM", "HOANG", "PHAN", "VU", "VO",
+    "DANG", "BUI", "DO", "HO", "NGO", "DUONG", "LY",
+]
+
+# Gender of the curated first-name pool (build_pools.py head+tail). Drives name<->sex
+# correlation: an entity's sex is drawn first, then its first name is sampled from the
+# matching pool, so we never emit JOSE/FEMALE or MARIA/MALE. Names NOT listed here are
+# treated as unisex (eligible for either sex) — covers ambiguous / Vietnamese-given /
+# Hawaiian names (GUADALUPE, KAI, LINH, MINH, NGUYEN, NOA, PHUONG, HUONG, ...).
+_FEMALE_NAMES = {
+    "MARIA", "JESSICA", "ANA", "JENNIFER", "ELIZABETH", "ASHLEY", "MICHELLE",
+    "PATRICIA", "SANDRA", "ROSA", "STEPHANIE", "MARY", "DIANA", "LAURA", "JASMINE",
+    "ADRIANA", "AGNES", "ALANA", "ANGELA", "BEATRIZ", "BERNICE", "CAMILA", "CONSUELO",
+    "DELORES", "DOLORES", "DOROTHY", "EDITH", "ESPERANZA", "EVELYN", "FERNANDA",
+    "FRANCES", "GABRIELA", "GERTRUDE", "GLORIA", "ISABELA", "KEISHA", "KIMBERLY",
+    "LATOYA", "LEILANI", "LORENA", "LUCIA", "MABEL", "MALIA", "MARGARET",
+    "MARTA", "RENATA", "ROCIO", "SHANICE", "TANISHA", "VALENTINA", "VERONICA",
+    "XIMENA", "PILAR",
+    # (THI / MAI deliberately left unisex — they double as Vietnamese given-name tokens
+    #  in the M-NAME-05 order-swap pool, so tagging them female would create spurious
+    #  name<->sex mismatches there.)
+}
+_MALE_NAMES = {
+    "JOSE", "MICHAEL", "DAVID", "JUAN", "JAMES", "DANIEL", "ANTHONY", "JOHN", "ROBERT",
+    "LUIS", "WILLIAM", "ANGEL", "CHRISTOPHER", "JOSEPH", "KEVIN", "CARLOS", "JOSHUA",
+    "JONATHAN", "JESUS", "BRIAN", "CHARLES", "MIGUEL", "JORGE", "THOMAS", "ERIC",
+    "ALBERTO", "ALEJANDRO", "ANDREW", "ANTONIO", "ARMANDO", "BRANDON", "CLARENCE",
+    "DARNELL", "DEANDRE", "DESHAWN", "EDUARDO", "EMILIANO", "ENRIQUE", "EUGENE",
+    "FERNANDO", "FLOYD", "GERALD", "GERARDO", "HAROLD", "HOWARD", "JAMAL", "JASON",
+    "JAVIER", "KEANU", "LEONARD", "MALIK", "MARQUIS", "MATEO", "MATTHEW", "RAFAEL",
+    "RALPH", "RAMON", "RICARDO", "RICHARD", "ROBERTO", "SANTIAGO", "SERGIO", "TREVON",
+    "TUAN", "TYRONE", "VICTOR", "WALTER", "WILLARD",
+}
+
+
+def name_gender(name):
+    """'MALE' / 'FEMALE' for a known gendered first name (using its first token), else
+    None (unisex / unknown — eligible for either sex)."""
+    if not name:
+        return None
+    tok = str(name).split()[0].upper()
+    if tok in _FEMALE_NAMES:
+        return "FEMALE"
+    if tok in _MALE_NAMES:
+        return "MALE"
+    return None
+
+
 EMAIL_DOMAIN_TYPOS = {
     "gmail.com": ["gamil.com", "gmai.com", "gnail.com", "gmail.co"],
     "yahoo.com": ["yaho.com", "yahooo.com", "yahoo.co"],
@@ -269,6 +326,19 @@ class Generator:
         self.zip5_map = stats.zip5_by_zip3()
         self.suf, self.suf_w = stats.street_suffix_weights()
         self.edom, self.edom_w = stats.email_domain_weights()
+        # Gendered first-name pools (head keeps weights, tail flat). A name is eligible
+        # for sex S if its gender is S or it is unisex (name_gender -> None).
+        def _split(items, getname):
+            out = {"MALE": [], "FEMALE": []}
+            for it in items:
+                g = name_gender(getname(it))
+                if g != "FEMALE":
+                    out["MALE"].append(it)
+                if g != "MALE":
+                    out["FEMALE"].append(it)
+            return out
+        self.first_head_sex = _split(self.pools.first_head, lambda x: x[0])
+        self.first_tail_sex = _split(self.pools.first_tail, lambda x: x)
 
     # -- low-level samplers --------------------------------------------------
     def _choice(self, seq):
@@ -277,14 +347,17 @@ class Generator:
     def _weighted(self, seq, weights):
         return self.rng.choices(seq, weights=weights, k=1)[0]
 
-    def sample_first(self, year=None):
-        # by_year SSA enrichment is not loaded offline; flat measured draw
-        # already reflects this population's age mix (§14.4 note).
-        if self.rng.random() < 0.83 and self.pools.first_head:
-            names = [n for n, _ in self.pools.first_head]
-            w = [c for _, c in self.pools.first_head]
+    def sample_first(self, sex=None):
+        # Sampled conditional on sex so first name matches sex (name<->sex correlation).
+        # by_year SSA enrichment is not loaded offline; flat measured draw already
+        # reflects this population's age mix (§14.4 note). sex None/OTHER -> any name.
+        head = self.first_head_sex[sex] if sex in ("MALE", "FEMALE") else self.pools.first_head
+        tail = self.first_tail_sex[sex] if sex in ("MALE", "FEMALE") else self.pools.first_tail
+        if self.rng.random() < 0.83 and head:
+            names = [n for n, _ in head]
+            w = [c for _, c in head]
             return self._weighted(names, w)
-        return self._choice(self.pools.first_tail or [n for n, _ in self.pools.first_head])
+        return self._choice(tail or [n for n, _ in head])
 
     def sample_last(self):
         if self.rng.random() < 0.85 and self.pools.last_head:
@@ -372,7 +445,7 @@ class Generator:
         return f"{local}@{domain}"
 
     # -- entity construction -------------------------------------------------
-    def make_entity(self, force_pediatric=None, force_full_ssn=None) -> Entity:
+    def make_entity(self, force_pediatric=None, force_full_ssn=None, force_sex=None) -> Entity:
         dob = self.sample_dob()
         pediatric = (dob.year >= 2010) if force_pediatric is None else force_pediatric
         if force_pediatric:
@@ -394,24 +467,31 @@ class Generator:
             bits["ssn_full"] = True
             bits["ssn_last4"] = True
 
+        # Latent (true) sex is drawn first for EVERY entity, even when the sex field is
+        # absent, so the first name can be conditioned on it (name<->sex correlation).
+        # The sex *field* shows the latent sex only when present per the missingness
+        # pattern. OTHER -> name drawn from any pool (name_sex None).
+        latent_sex = force_sex or self._weighted(self.sex_vals, self.sex_w)
+        name_sex = latent_sex if latent_sex in ("MALE", "FEMALE") else None
+
         # names
-        first = self.sample_first(dob.year)
+        first = self.sample_first(name_sex)
         last = self.sample_last()
         if self.rng.random() < 0.07:  # p_two_surname
             last = f"{last} {self.sample_last()}"
         elif self.rng.random() < 0.018:  # p_hyphen_last
             last = f"{last}-{self.sample_last()}"
         if self.rng.random() < 0.02:  # p_compound_first
-            first = f"{first} {self.sample_first(dob.year)}"
+            first = f"{first} {self.sample_first(name_sex)}"
 
         middle = None
         if bits.get("middle"):
             if self.rng.random() < 0.97:
                 middle = self.rng.choice("ABCDEFGHIJKLMNOPRSTV")
             else:
-                middle = self.sample_first(dob.year)
+                middle = self.sample_first(name_sex)
 
-        sex = self._weighted(self.sex_vals, self.sex_w) if bits.get("sex") else None
+        sex = latent_sex if bits.get("sex") else None
 
         # ssn
         ssn = last4 = None
@@ -450,7 +530,7 @@ class Generator:
             "ZipCD_clean_base": zip5, "ZipCD_clean_ext": None,
             "SexAtBirthDSC_clean": sex,
             "Email_clean": email,
-            "_phones": phones, "_region": region,
+            "_phones": phones, "_region": region, "_latent_sex": latent_sex,
         }
         eid = f"E{self.entity_counter:09d}"
         self.entity_counter += 1
@@ -767,27 +847,33 @@ def clone(canonical: dict) -> dict:
     return c
 
 
-def apply_calibrated_corruptions(gen: Generator, base: dict, messiness: float = 1.0) -> tuple[dict, list]:
+def apply_calibrated_corruptions(gen: Generator, base: dict) -> tuple[dict, list]:
     """Produce one corrupted variant of `base`, applying each field's corruption
     independently at the §7 calibrated marginal (the locked application model).
-
-    `messiness > 1.0` is the §7 dirty-tail multiplier: it scales every field's
-    P(differs) up *together* (capped near 1.0), so corruptions correlate and many
-    fields drift at once — the "everything is a mess" tail the marginals alone miss.
+    Used as realistic background drift on top of an anchored scenario, and on each
+    side of a hard negative.
     """
     corr = Corruptions(gen)
     c = clone(base)
     applied = []
     rng = gen.rng
 
-    def p(field):  # calibrated marginal, amplified by the messiness multiplier
-        return min(DIFFER_RATES[field] * messiness, 0.97)
+    def p(field):  # calibrated marginal
+        return DIFFER_RATES[field]
 
-    # Name: last-name change dominates; pick change type when it fires.
+    # Name: last-name change dominates; pick change type when it fires. A full surname
+    # *replacement* (maiden<->married) is overwhelmingly female — men rarely change their
+    # surname on marriage — so gate replace_last on non-male. Token-drop and typo changes
+    # are gender-neutral, so males route to those instead (the differ-rate marginal holds).
     if rng.random() < p("last_name"):
+        female_eligible = c.get("_latent_sex") != "MALE"
         roll = rng.random()
-        fn = (corr.replace_last if roll < 0.45 else
-              corr.drop_one_surname if roll < 0.6 else corr.typo_last)
+        if roll < 0.45 and female_eligible:
+            fn = corr.replace_last
+        elif roll < 0.6:
+            fn = corr.drop_one_surname
+        else:
+            fn = corr.typo_last
         applied.append(fn(c) or corr.typo_last(c))
     if rng.random() < p("first_name"):
         fn = corr.nickname if rng.random() < 0.4 else corr.typo_first
@@ -954,13 +1040,29 @@ class ScenarioLib:
 
     def ensure_sex(self, e):
         if not e.canonical["SexAtBirthDSC_clean"]:
-            e.canonical["SexAtBirthDSC_clean"] = self.rng.choice(["MALE", "FEMALE"])
+            # Reveal the entity's latent sex (keeps name<->sex consistent); fall back to
+            # the first name's gender, then random for genuinely unisex names.
+            ls = e.canonical.get("_latent_sex")
+            if ls not in ("MALE", "FEMALE"):
+                ls = name_gender(e.canonical.get("FirstNM_clean")) or self.rng.choice(["MALE", "FEMALE"])
+            e.canonical["SexAtBirthDSC_clean"] = ls
 
-    def diff_first(self, avoid):
-        f = self.gen.sample_first()
+    def diff_first(self, avoid, sex=None):
+        f = self.gen.sample_first(sex)
         while f == avoid:
-            f = self.gen.sample_first()
+            f = self.gen.sample_first(sex)
         return f
+
+    def set_first(self, e, name):
+        """Assign a first name to an entity AND keep its sex consistent: if the name is
+        gendered and the sex field is present, align it (used where NM scenarios force a
+        shared/specific first name across two people)."""
+        e.canonical["FirstNM_clean"] = name
+        g = name_gender(name)
+        if g:
+            e.canonical["_latent_sex"] = g
+            if e.canonical.get("SexAtBirthDSC_clean") is not None:
+                e.canonical["SexAtBirthDSC_clean"] = g
 
     # ======================= MATCH scenarios (label=1) ==================== #
     # ---- No-SSN-led ----
@@ -993,6 +1095,20 @@ class ScenarioLib:
         c = self.corr.typo_first(B) if self.rng.random() < 0.5 else self.corr.typo_last(B)
         return A, e.entity_id, B, e.entity_id, 1, "M-NOSSN-05", [c]
 
+    def m_household_dup(self):
+        # POL-AMBIG-03: same name + DOB + address, no SSN on either side. Genuinely
+        # ambiguous (household coincidence vs the same patient registered twice).
+        # Project policy: treat as a LOW-WEIGHT match, tagged for separate auditing.
+        # Strong signals (name/DOB/address) stay identical — that's the ambiguity —
+        # while a weak field (phone, sometimes email) drifts so it isn't a trivial
+        # 15-field clone. Emitted WITHOUT enforce_positive so the strong fields stay equal.
+        e = self._ent(); self.ensure_no_ssn(e); self.ensure_address(e); self.ensure_phone(e)
+        A, B = clone(e.canonical), clone(e.canonical)
+        corr = [self.corr.phone_replace(B)]
+        if self.rng.random() < 0.5 and self.corr.email_change(B):
+            corr.append("email_change")
+        return A, e.entity_id, B, e.entity_id, 1, "POL-AMBIG-03", [c for c in corr if c]
+
     # ---- SSN-led ----
     def m_ssn_identical(self):
         e = self._ent(force_full_ssn=True); self.ensure_full_ssn(e); self.ensure_address(e)
@@ -1011,7 +1127,9 @@ class ScenarioLib:
         return A, e.entity_id, B, e.entity_id, 1, "M-SSN-03", ["drop_middle"]
 
     def m_ssn_maiden_married(self):
-        e = self._ent(force_full_ssn=True); self.ensure_full_ssn(e)
+        # Maiden<->married surname change is a female event; force the entity female so the
+        # name+sex read consistently with the lesson (SSN trumps a surname change).
+        e = self._ent(force_full_ssn=True, force_sex="FEMALE"); self.ensure_full_ssn(e)
         A, B = clone(e.canonical), clone(e.canonical)
         B["LastNM_clean"] = self.gen.sample_last()
         return A, e.entity_id, B, e.entity_id, 1, "M-SSN-04", ["replace_last"]
@@ -1085,9 +1203,12 @@ class ScenarioLib:
         return A, e.entity_id, B, e.entity_id, 1, "M-L4-04", ["drop_full_ssn"]
 
     def m_l4_asym_namedrift(self):
+        # M-L4-04: asymmetric full-SSN-vs-matching-last-4 PLUS a name typo. The pure
+        # no-drift asymmetric case is identical to M-SSN-09, so the two are merged:
+        # M-SSN-09 is the canonical clean asymmetric pair; this one always adds drift.
         a, eid, b, _, lab, _, corr = self.m_l4_asym()
         self.corr.typo_last(b)
-        return a, eid, b, eid, 1, "M-L4-05", corr + ["typo_last"]
+        return a, eid, b, eid, 1, "M-L4-04", corr + ["typo_last"]
 
     # ---- Name-coupling-led ----
     def m_name_hyphen(self):
@@ -1099,7 +1220,16 @@ class ScenarioLib:
 
     def m_name_first_middle_swap(self):
         e = self._ent(force_full_ssn=True); self.ensure_full_ssn(e); self.ensure_middle(e)
-        e.canonical["MiddleNM_clean"] = self.gen.sample_first()
+        # Middle must differ from first, else the first<->middle swap is a no-op that
+        # yields an identical pair (the no-identical guard would then inject a name typo
+        # and break token-set invariance for what should be a pure shuffle).
+        # Draw the middle (which becomes B's first after the swap) of the entity's sex,
+        # so the swapped first name stays sex-consistent.
+        msex = e.canonical.get("_latent_sex")
+        mid = self.gen.sample_first(msex)
+        while mid == e.canonical["FirstNM_clean"]:
+            mid = self.gen.sample_first(msex)
+        e.canonical["MiddleNM_clean"] = mid
         A, B = clone(e.canonical), clone(e.canonical)
         B["FirstNM_clean"], B["MiddleNM_clean"] = B["MiddleNM_clean"], B["FirstNM_clean"]
         return A, e.entity_id, B, e.entity_id, 1, "M-NAME-02", ["swap_first_middle"]
@@ -1120,7 +1250,8 @@ class ScenarioLib:
 
     def m_name_vietnamese_swap(self):
         e = self._ent(force_full_ssn=True); self.ensure_full_ssn(e)
-        given, fam = "NGUYEN", "THI MAI"
+        given = self.rng.choice(VIET_GIVEN)
+        fam = self.rng.choice(VIET_FAMILY)
         A = clone(e.canonical); A["FirstNM_clean"] = given; A["LastNM_clean"] = fam; A["MiddleNM_clean"] = None
         B = clone(e.canonical); B["FirstNM_clean"] = fam; B["LastNM_clean"] = given; B["MiddleNM_clean"] = None
         return A, e.entity_id, B, e.entity_id, 1, "M-NAME-05", ["name_order_swap"]
@@ -1134,7 +1265,8 @@ class ScenarioLib:
 
     def m_name_compound_first_dropped(self):
         e = self._ent(force_full_ssn=True); self.ensure_full_ssn(e)
-        f1, f2 = self.gen.sample_first(), self.gen.sample_first()
+        fsex = e.canonical.get("_latent_sex")  # compound first stays sex-consistent
+        f1, f2 = self.gen.sample_first(fsex), self.gen.sample_first(fsex)
         A = clone(e.canonical); A["FirstNM_clean"] = f"{f1} {f2}"
         B = clone(e.canonical); B["FirstNM_clean"] = f1
         return A, e.entity_id, B, e.entity_id, 1, "M-NAME-07", ["compound_first_dropped"]
@@ -1154,7 +1286,7 @@ class ScenarioLib:
     def m_name_nickname(self):
         canon = self.rng.choice(list(self.gen.pools.nicknames.keys()))
         e = self._ent(force_full_ssn=True); self.ensure_full_ssn(e)
-        e.canonical["FirstNM_clean"] = canon
+        self.set_first(e, canon)  # align entity sex to the nickname's gender
         A, B = clone(e.canonical), clone(e.canonical)
         B["FirstNM_clean"] = self.rng.choice(self.gen.pools.nicknames[canon])
         return A, e.entity_id, B, e.entity_id, 1, "M-NAME-09", ["nickname"]
@@ -1173,6 +1305,18 @@ class ScenarioLib:
 
     def m_name_typo_insdel(self):
         return self._m_name_typo("M-NAME-12")
+
+    def m_name_middle_conflict(self):
+        # M-NAME-17: strong anchor agrees (full SSN) but both sides carry a *different*
+        # middle name/initial. Teaches that a conflicting middle weakens but does not
+        # break a match when a decisive identifier agrees.
+        e = self._ent(force_full_ssn=True); self.ensure_full_ssn(e); self.ensure_middle(e)
+        A, B = clone(e.canonical), clone(e.canonical)
+        m = self.rng.choice("ABCDEFGHIJKLMNRSTV")
+        while m == A["MiddleNM_clean"]:
+            m = self.rng.choice("ABCDEFGHIJKLMNRSTV")
+        B["MiddleNM_clean"] = m
+        return A, e.entity_id, B, e.entity_id, 1, "M-NAME-17", ["middle_conflict"]
 
     # ---- DOB / address / phone / email / sex / pediatric drift ----
     def m_addr_apt_toggle(self):
@@ -1264,7 +1408,11 @@ class ScenarioLib:
     def m_sex_other(self):
         e = self._ent(force_full_ssn=True); self.ensure_full_ssn(e)
         A = clone(e.canonical); A["SexAtBirthDSC_clean"] = "OTHER"
-        B = clone(e.canonical); B["SexAtBirthDSC_clean"] = self.rng.choice(["MALE", "FEMALE"])
+        # B's binary sex follows the entity's name (latent), not a coin flip.
+        ls = e.canonical.get("_latent_sex")
+        B = clone(e.canonical)
+        B["SexAtBirthDSC_clean"] = ls if ls in ("MALE", "FEMALE") else \
+            (name_gender(e.canonical["FirstNM_clean"]) or self.rng.choice(["MALE", "FEMALE"]))
         return A, e.entity_id, B, e.entity_id, 1, "M-SEX-02", ["sex_other"]
 
     def m_ped_thin(self):
@@ -1295,8 +1443,7 @@ class ScenarioLib:
         self.corr.typo_last(B); self.corr.address_move(B); self.corr.phone_replace(B)
         return A, e.entity_id, B, e.entity_id, 1, "M-MIX-02", ["typo_last", "address_move", "phone_replace"]
 
-    def m_mix_thin(self):
-        return self.m_nossn_thin()[:5] + ("M-MIX-03", [])
+    # (M-MIX-03 removed: it was identical to M-NOSSN-04 — thin records are covered there.)
 
     # ---- §8.4 additional structural hard MATCH cases ---- #
     def m_name_first_initial(self):
@@ -1313,13 +1460,8 @@ class ScenarioLib:
         c = self.corr.truncate_name(B) or self.corr.typo_last(B)
         return A, e.entity_id, B, e.entity_id, 1, "M-NAME-14", [c]
 
-    def m_name_crosslang(self):
-        canon = self.rng.choice(list(self.gen.pools.nicknames.keys()))
-        e = self._ent()
-        e.canonical["FirstNM_clean"] = canon
-        A, B = clone(e.canonical), clone(e.canonical)
-        B["FirstNM_clean"] = self.rng.choice(self.gen.pools.nicknames[canon])
-        return A, e.entity_id, B, e.entity_id, 1, "M-NAME-15", ["cross_lang_variant"]
+    # (M-NAME-15 removed: cross-language variants are drawn from the same nickname pool
+    #  as M-NAME-09 — the two are merged into M-NAME-09, which now covers both.)
 
     def m_name_concat(self):
         e = self._ent()
@@ -1369,7 +1511,8 @@ class ScenarioLib:
             b.canonical["LastNM_clean"] = a.canonical["LastNM_clean"]
         if diff_last:
             b.canonical["LastNM_clean"] = self.diff_last(a.canonical["LastNM_clean"])
-        b.canonical["FirstNM_clean"] = self.diff_first(a.canonical["FirstNM_clean"])
+        b.canonical["FirstNM_clean"] = self.diff_first(
+            a.canonical["FirstNM_clean"], b.canonical.get("_latent_sex"))
         if same_dob:
             b.canonical["BirthDT_clean"] = a.canonical["BirthDT_clean"]
         elif dob_gap is not None:
@@ -1397,6 +1540,8 @@ class ScenarioLib:
     def nm_jr_sr(self):
         a, eid_a, b, eid_b, lab, _, _ = self._household("NM-HH-JR-SR", same_last=True, dob_gap=(20, 40))
         b["FirstNM_clean"] = a["FirstNM_clean"]  # same given name (Jr/Sr)
+        if b.get("SexAtBirthDSC_clean") is not None:  # same name -> same sex
+            b["SexAtBirthDSC_clean"] = a["SexAtBirthDSC_clean"] or b["SexAtBirthDSC_clean"]
         b["SuffixNM_clean"] = "JR"
         return a, eid_a, b, eid_b, 0, "NM-HH-JR-SR", []
 
@@ -1420,7 +1565,7 @@ class ScenarioLib:
             shared = self.gen.sample_last()
         shared_first = self.gen.sample_first()
         for e in (a, b):
-            e.canonical["FirstNM_clean"] = shared_first
+            self.set_first(e, shared_first)  # shared name -> both sexes aligned to it
             e.canonical["LastNM_clean"] = shared
             self.ensure_address(e)
             e.canonical["CityNM_clean"] = "CHICAGO"; e.canonical["StateCD_clean"] = "IL"
@@ -1452,7 +1597,7 @@ class ScenarioLib:
         shared_first, shared_last = self.gen.sample_first(), self.gen.sample_last()
         ac = self.rng.choice(["773", "312", "708"])
         for e in (a, b):
-            e.canonical["FirstNM_clean"] = shared_first; e.canonical["LastNM_clean"] = shared_last
+            self.set_first(e, shared_first); e.canonical["LastNM_clean"] = shared_last
             e.canonical["_phones"] = [ac + self.gen.gen_phone("CHICAGO")[3:]]
         b.canonical["SSN_clean"] = None; b.canonical["last_4_SSN"] = None
         return clone(a.canonical), a.entity_id, clone(b.canonical), b.entity_id, 0, "NM-COMMON-05", []
@@ -1477,7 +1622,11 @@ class ScenarioLib:
 
     def nm_ssn_opposite_sex(self):
         a, eid_a, b, eid_b, *_ = self.nm_ssn_typo_collision()
+        # Opposite sex is the disambiguator; keep each record internally consistent by
+        # giving each a sex-appropriate first name (A male, B female).
         a["SexAtBirthDSC_clean"], b["SexAtBirthDSC_clean"] = "MALE", "FEMALE"
+        a["FirstNM_clean"] = self.gen.sample_first("MALE")
+        b["FirstNM_clean"] = self.gen.sample_first("FEMALE")
         return a, eid_a, b, eid_b, 0, "NM-SSN-04", []
 
     def nm_full_vs_mismatch_last4(self):
@@ -1518,7 +1667,8 @@ class ScenarioLib:
         a, b = self._two(force_pediatric=True); self.ensure_address(a); self.ensure_phone(a)
         _copy(a.canonical, b.canonical, ADDR_FIELDS)
         b.canonical["LastNM_clean"] = a.canonical["LastNM_clean"]
-        b.canonical["FirstNM_clean"] = self.diff_first(a.canonical["FirstNM_clean"])
+        b.canonical["FirstNM_clean"] = self.diff_first(
+            a.canonical["FirstNM_clean"], b.canonical.get("_latent_sex"))
         b.canonical["_phones"] = [a.canonical["_phones"][0]]
         return clone(a.canonical), a.entity_id, clone(b.canonical), b.entity_id, 0, "NM-PED-01", []
 
@@ -1527,7 +1677,8 @@ class ScenarioLib:
         _copy(a.canonical, b.canonical, ADDR_FIELDS)
         b.canonical["BirthDT_clean"] = a.canonical["BirthDT_clean"]
         b.canonical["LastNM_clean"] = self.diff_last(a.canonical["LastNM_clean"])
-        b.canonical["FirstNM_clean"] = self.diff_first(a.canonical["FirstNM_clean"])
+        b.canonical["FirstNM_clean"] = self.diff_first(
+            a.canonical["FirstNM_clean"], b.canonical.get("_latent_sex"))
         return clone(a.canonical), a.entity_id, clone(b.canonical), b.entity_id, 0, "NM-PED-02", []
 
     def nm_thin_diff_name(self):
@@ -1542,6 +1693,8 @@ class ScenarioLib:
     def nm_thin_diff_dob(self):
         a, eid_a, b, eid_b, *_ = self.nm_thin_diff_name()
         b["FirstNM_clean"] = a["FirstNM_clean"]; b["LastNM_clean"] = a["LastNM_clean"]
+        if b.get("SexAtBirthDSC_clean") is not None:  # B adopts A's full name -> same sex
+            b["SexAtBirthDSC_clean"] = a["SexAtBirthDSC_clean"] or b["SexAtBirthDSC_clean"]
         y = int(a["BirthDT_clean"][:4])
         b["BirthDT_clean"] = a["BirthDT_clean"].replace(str(y), str(max(y - 8, 1900)), 1)
         return a, eid_a, b, eid_b, 0, "NM-BND-02", []
@@ -1551,13 +1704,15 @@ class ScenarioLib:
         a, b = self._two()
         f, l = self.gen.sample_first(), self.gen.sample_last()
         for e in (a, b):
-            e.canonical["FirstNM_clean"] = f; e.canonical["LastNM_clean"] = l
+            self.set_first(e, f); e.canonical["LastNM_clean"] = l
         y, m, d = map(int, a.canonical["BirthDT_clean"].split("-"))
-        try:
-            b.canonical["BirthDT_clean"] = date(y, m, d).replace(
-                day=min(max(d + self.rng.choice([-2, -1, 1, 2]), 1), 28)).isoformat()
-        except ValueError:
-            pass
+        # Shift the day by ±1-2, but guarantee it actually changes (clamping at the
+        # 1/28 boundary must not collapse B's DOB back onto A's — that would make a
+        # same-name negative also share exact DOB, the same-person signature).
+        new_d = min(max(d + self.rng.choice([-2, -1, 1, 2]), 1), 28)
+        if new_d == d:
+            new_d = d - 1 if d > 1 else d + 1
+        b.canonical["BirthDT_clean"] = date(y, m, new_d).isoformat()
         b.canonical["SSN_clean"] = b.canonical["last_4_SSN"] = None
         return clone(a.canonical), a.entity_id, clone(b.canonical), b.entity_id, 0, "NM-COMMON-06", []
 
@@ -1577,49 +1732,42 @@ class ScenarioLib:
         b.canonical["BirthDT_clean"] = a.canonical["BirthDT_clean"]
         return clone(a.canonical), a.entity_id, clone(b.canonical), b.entity_id, 0, "NM-SSN-06", []
 
+    def nm_similar_first(self):
+        # NM-COMMON-07: nickname "false friend" — same surname, near-variant first name
+        # (looks like the M-NAME-09 nickname case) but a different person (DOB >=5y apart,
+        # no shared SSN). Teaches that name similarity alone is not identity.
+        a, b = self._two()
+        shared_last = self.gen.sample_last()
+        f = self.gen.sample_first()
+        for e in (a, b):
+            e.canonical["LastNM_clean"] = shared_last
+            self.ensure_address(e)
+            e.canonical["CityNM_clean"] = "CHICAGO"; e.canonical["StateCD_clean"] = "IL"
+        self.set_first(a, f)
+        b.canonical["FirstNM_clean"] = _typo(self.rng, f) or self.diff_first(f)
+        if name_gender(f) and b.canonical.get("SexAtBirthDSC_clean") is not None:
+            b.canonical["SexAtBirthDSC_clean"] = name_gender(f)  # near-variant of f -> same sex
+        y = int(a.canonical["BirthDT_clean"][:4])
+        b.canonical["BirthDT_clean"] = a.canonical["BirthDT_clean"].replace(
+            str(y), str(min(max(y + self.rng.choice([-9, -7, 7, 9]), 1900), 2026)), 1)
+        b.canonical["SSN_clean"] = b.canonical["last_4_SSN"] = None
+        return clone(a.canonical), a.entity_id, clone(b.canonical), b.entity_id, 0, "NM-COMMON-07", []
 
-# Bucket -> (weight-of-side, [scenario method names]). Flag-gated scenarios
-# (§8.3) excluded by default.
-MATCH_BUCKETS = {
-    "NOSSN": (0.30, ["m_nossn_control", "m_nossn_addr_moved", "m_nossn_phone_overlap",
-                     "m_nossn_thin", "m_nossn_name_typo"]),
-    "NAME":  (0.20, ["m_name_hyphen", "m_name_first_middle_swap", "m_name_two_surname_shuffle",
-                     "m_name_two_surname_collapse", "m_name_vietnamese_swap", "m_name_middle_initial",
-                     "m_name_compound_first_dropped", "m_name_suffix", "m_name_suffix_wrong_slot",
-                     "m_name_nickname", "m_name_typo_sub", "m_name_typo_trans", "m_name_typo_insdel"]),
-    "SSN":   (0.15, ["m_ssn_identical", "m_ssn_name_typo", "m_ssn_missing_middle", "m_ssn_maiden_married",
-                     "m_ssn_moved", "m_ssn_moved_oos", "m_ssn_diff_contact", "m_ssn_dob_drift",
-                     "m_ssn_full_vs_last4", "m_ssn_vs_nossn", "m_ssn_heavy_drift"]),
-    "L4":    (0.08, ["m_l4_control", "m_l4_name_typo", "m_l4_dob_drift", "m_l4_asym", "m_l4_asym_namedrift"]),
-    "DRIFT": (0.20, ["m_addr_apt_toggle", "m_addr_apt_change", "m_addr_line2_absorb", "m_addr_house_typo",
-                     "m_dob_transpose", "m_dob_off_year", "m_dob_off_day", "m_dob_null",
-                     "m_phone_partial", "m_phone_disjoint", "m_email_change", "m_email_domain_typo",
-                     "m_sex_other", "m_ped_thin", "m_ped_last4", "m_ped_name_drift"]),
-    "MIX":   (0.07, ["m_mix_two", "m_mix_three", "m_mix_thin"]),
-}
-NM_BUCKETS = {
-    "EASY":   (0.15, ["nm_random", "nm_same_state"]),
-    "HH":     (0.30, ["nm_twin", "nm_triplet_like", "nm_jr_sr", "nm_sibling",
-                      "nm_parent_child", "nm_spouse", "nm_roommate"]),
-    "COMMON": (0.22, ["nm_common_name_city", "nm_common_name_zip", "nm_hispanic_surname",
-                      "nm_top_zip_collision", "nm_areacode"]),
-    "SSN":    (0.13, ["nm_last4_collision", "nm_last4_first_letter", "nm_ssn_typo_collision",
-                      "nm_ssn_opposite_sex", "nm_full_vs_mismatch_last4"]),
-    "IDF":    (0.12, ["nm_shelter_addr", "nm_family_phone", "nm_family_email", "nm_addr_and_phone"]),
-    "PED":    (0.05, ["nm_ped_siblings", "nm_ped_same_dob"]),
-    "BND":    (0.03, ["nm_thin_diff_name", "nm_thin_diff_dob"]),
-}
-
-
-def allocate(buckets: dict, total: int) -> list:
-    """Round-robin scenario calls to hit per-bucket budgets."""
-    plan = []
-    for _bucket, (weight, methods) in buckets.items():
-        n = round(weight * total)
-        per = max(1, n // len(methods))
-        for m in methods:
-            plan.append((m, per))
-    return plan
+    def nm_email_domain(self):
+        # NM-IDF-05: same surname + same email *provider* (gmail.com etc.) but different
+        # local part and different person. Teaches that a shared email domain is not a
+        # match signal (66% of the population is on gmail). Surname collision keeps it a
+        # blocking-survivor-like hard negative.
+        a, b = self._two()
+        shared_last = self.gen.sample_last()
+        a.canonical["LastNM_clean"] = b.canonical["LastNM_clean"] = shared_last
+        b.canonical["FirstNM_clean"] = self.diff_first(
+            a.canonical["FirstNM_clean"], b.canonical.get("_latent_sex"))
+        self.ensure_email(a); self.ensure_email(b)
+        domain = a.canonical["Email_clean"].split("@")[1]
+        b.canonical["Email_clean"] = b.canonical["Email_clean"].split("@")[0] + "@" + domain
+        b.canonical["SSN_clean"] = b.canonical["last_4_SSN"] = None
+        return clone(a.canonical), a.entity_id, clone(b.canonical), b.entity_id, 0, "NM-IDF-05", []
 
 
 # --------------------------------------------------------------------------- #
@@ -1657,19 +1805,27 @@ def recompute_derived(rec: dict) -> None:
 # --------------------------------------------------------------------------- #
 SSN_COVER = ["m_ssn_name_typo", "m_ssn_missing_middle", "m_ssn_maiden_married",
              "m_ssn_moved", "m_ssn_moved_oos", "m_ssn_diff_contact",
-             "m_ssn_dob_drift", "m_ssn_heavy_drift"]
-L4_COVER = ["m_l4_name_typo", "m_l4_dob_drift", "m_l4_asym", "m_l4_asym_namedrift",
+             "m_ssn_dob_drift", "m_ssn_heavy_drift",
+             # DOB-drift tolerance is conceptually "SSN trumps a DOB typo" — it must
+             # stay in the full-SSN band so the SSN anchor survives. In the no-SSN
+             # hard band, enforce_positive stripped the SSN and the matching address,
+             # leaving thin name-only pairs whose drifted DOB no longer agreed (no
+             # surviving anchor). Off-by-one DOB is <0.1% in real data anyway, so an
+             # SSN-anchored minority here matches both the anchor rule and reality.
+             "m_dob_transpose", "m_dob_off_year", "m_dob_off_day", "m_dob_null"]
+L4_COVER = ["m_l4_name_typo", "m_l4_dob_drift", "m_l4_asym_namedrift",
             "m_ssn_full_vs_last4"]
 HARD_COVER = [
-    "m_nossn_addr_moved", "m_nossn_phone_overlap", "m_nossn_name_typo",
+    "m_nossn_addr_moved", "m_nossn_phone_overlap", "m_nossn_name_typo", "m_nossn_thin",
     "m_name_hyphen", "m_name_first_middle_swap", "m_name_two_surname_shuffle",
     "m_name_two_surname_collapse", "m_name_vietnamese_swap", "m_name_middle_initial",
     "m_name_compound_first_dropped", "m_name_suffix", "m_name_suffix_wrong_slot",
     "m_name_nickname", "m_name_typo_sub", "m_name_typo_trans", "m_name_typo_insdel",
-    "m_name_first_initial", "m_name_truncate", "m_name_crosslang", "m_name_concat",
+    "m_name_middle_conflict",
+    "m_name_first_initial", "m_name_truncate", "m_name_concat",
     "m_addr_apt_toggle", "m_addr_apt_change", "m_addr_line2_absorb", "m_addr_house_typo",
     "m_addr_within_zip", "m_addr_directional", "m_zip_drift",
-    "m_dob_transpose", "m_dob_off_year", "m_dob_off_day", "m_dob_null",
+    # m_dob_* moved to SSN_COVER (DOB drift must stay SSN-anchored — see note there).
     "m_phone_partial", "m_phone_disjoint", "m_email_change", "m_email_domain_typo",
     "m_sex_other", "m_ped_name_drift", "m_mix_two", "m_mix_three"]
 
@@ -1677,11 +1833,11 @@ NM_EASY_COVER = ["nm_random", "nm_same_state"]
 NM_HARD_COVER = [
     "nm_twin", "nm_triplet_like", "nm_jr_sr", "nm_sibling", "nm_parent_child",
     "nm_spouse", "nm_roommate", "nm_common_name_city", "nm_common_name_zip",
-    "nm_hispanic_surname", "nm_top_zip_collision", "nm_areacode",
+    "nm_hispanic_surname", "nm_top_zip_collision", "nm_areacode", "nm_similar_first",
     "nm_common_adjacent_dob", "nm_cousin", "nm_last4_collision", "nm_last4_first_letter",
     "nm_ssn_typo_collision", "nm_ssn_opposite_sex", "nm_full_vs_mismatch_last4",
     "nm_last4_dob", "nm_shelter_addr", "nm_family_phone", "nm_family_email",
-    "nm_addr_and_phone", "nm_ped_siblings", "nm_ped_same_dob",
+    "nm_addr_and_phone", "nm_email_domain", "nm_ped_siblings", "nm_ped_same_dob",
     "nm_thin_diff_name", "nm_thin_diff_dob"]
 
 _NAME_DOB_ADDR = ["FirstNM_clean", "LastNM_clean", "BirthDT_clean", "AddressLine1_clean"]
@@ -1729,6 +1885,11 @@ def enforce_positive(gen: Generator, recA: dict, recB: dict, band: str) -> None:
     recompute_derived(recB)
 
 
+# Low-weight share of the no-SSN (hard) positive band given to the ambiguous
+# POL-AMBIG-03 household-duplicate scenario (~2% of all positives).
+POL_AMBIG_FRAC = 0.025
+
+
 def _band_plan(n, easy=0.05, last4=0.15):
     n_easy = round(n * easy)
     n_l4 = round(n * last4)
@@ -1751,23 +1912,6 @@ def _run_methods(gen, pb, lib, methods, count, enforce_band=None):
     return rows
 
 
-def make_positive(gen: Generator, pb: "PairBuilder", band: str, dirty_frac: float) -> dict:
-    """Bulk within-entity match pair for a given SSN band, corruption scaled by band."""
-    e = gen.make_entity()
-    recA = pb.emit_record(e.canonical, e.entity_id)
-    if band == "easy":
-        messiness, case = gen.rng.uniform(1.0, 1.6), "M-BULK-EASY"
-    elif band == "last4":
-        messiness, case = gen.rng.uniform(1.3, 2.2), "M-BULK-L4"
-    else:
-        messiness = gen.rng.uniform(2.0, 3.5) if gen.rng.random() < dirty_frac else gen.rng.uniform(1.5, 2.6)
-        case = "M-BULK-HARD"
-    variant, applied = apply_calibrated_corruptions(gen, e.canonical, messiness=messiness)
-    recB = pb.emit_record(variant, e.entity_id)
-    enforce_positive(gen, recA, recB, band)
-    return pair_row(recA, recB, 1, case, applied)
-
-
 def force_shared_keys(gen: Generator, recA: dict, recB: dict, n_keys: int) -> str:
     """Copy `n_keys` distinct strong fields from A onto B so a cross-entity NON-match
     looks like a blocking survivor. Returns a case tag naming the shared keys."""
@@ -1782,13 +1926,22 @@ def force_shared_keys(gen: Generator, recA: dict, recB: dict, n_keys: int) -> st
     if not avail:
         avail = ["lastname"]
     keys = gen.rng.sample(avail, min(n_keys, len(avail)))
-    if n_keys >= 3 and recA["FirstNM_clean"] and "lastname" in keys:
-        keys = keys + ["firstname"]   # common full-name collision
+    # First name may ride along for a common-full-name collision (two different
+    # JOHN SMITHs) — but NEVER when the negative also shares DOB. With no SSN to
+    # separate them, first+last+exact-DOB *is* the same-person signature: adding any
+    # corroborator (shared address or phone) makes it indistinguishable from the
+    # name+DOB-anchored positives (M-NOSSN-*, M-ADDR-*, POL-AMBIG-03). Emitting that
+    # as a non-match is direct label noise, so the rider only fires when DOB differs.
+    if (n_keys >= 3 and recA["FirstNM_clean"] and "lastname" in keys
+            and "dob" not in keys):
+        keys = keys + ["firstname"]   # common full-name collision (different DOB)
     for key in keys:
         if key == "lastname":
             recB["LastNM_clean"] = recA["LastNM_clean"]
         elif key == "firstname":
             recB["FirstNM_clean"] = recA["FirstNM_clean"]
+            if name_gender(recA["FirstNM_clean"]) and recB.get("SexAtBirthDSC_clean"):
+                recB["SexAtBirthDSC_clean"] = name_gender(recA["FirstNM_clean"])  # shared name -> same sex
         elif key == "dob":
             recB["BirthDT_clean"] = recA["BirthDT_clean"]
         elif key == "addr":
@@ -1814,25 +1967,31 @@ def make_hard_negative(gen: Generator, pb: "PairBuilder") -> dict:
     return pair_row(recA, recB, 0, case, [])
 
 
-def _assemble(gen, pb, n_match, n_non, cover_frac, dirty_frac, easy_neg_frac):
-    """Shared assembly for train and test. Positives follow the §8.4 SSN bands
-    (5/15/80); negatives are `easy_neg_frac` easy + the rest hard (1-3 shared keys).
-    `cover_frac` of each band/group is filled from the enumerated catalog so EVERY
-    named scenario appears many times; the rest is realistic bulk. Train and test use
-    this same construction (so the test measures the same hard cases); they differ in
-    match prevalence, the disjoint entity pool, and easy-negative fraction (the test
-    is all-hard so precision is measured honestly)."""
+def _assemble(gen, pb, n_match, n_non, cover_frac, easy_neg_frac):
+    """Shared assembly for train and test. Positives are drawn entirely from the §8
+    scenario catalog (every named match case, each anchored on a surviving strong
+    signal + realistic background drift), distributed across the §8.4 SSN bands
+    (5/15/80). Negatives are `easy_neg_frac` easy + the rest hard (1-3 shared keys).
+    Train and test use this same construction (so the test measures the same hard
+    cases); they differ in match prevalence, the disjoint entity pool, and
+    easy-negative fraction (the test is all-hard so precision is measured honestly)."""
     lib = ScenarioLib(gen)
     rows = []
-    # ---- positives: SSN bands ----
+    # ---- positives: SSN bands, all from the anchored scenario catalog ----
     n_easy, n_l4, n_hard = _band_plan(n_match)
+    # Carve a small low-weight budget for the ambiguous POL-AMBIG-03 household-dup
+    # positive (same name+DOB+address, no SSN). Tagged for separate auditing.
+    n_pol = round(n_hard * POL_AMBIG_FRAC)
     for band, n, cover in (("easy", n_easy, SSN_COVER),
                            ("last4", n_l4, L4_COVER),
-                           ("hard", n_hard, HARD_COVER)):
-        n_cov = round(n * cover_frac)
-        rows += _run_methods(gen, pb, lib, cover, n_cov, enforce_band=band)
-        for _ in range(n - n_cov):
-            rows.append(make_positive(gen, pb, band, dirty_frac))
+                           ("hard", n_hard - n_pol, HARD_COVER)):
+        rows += _run_methods(gen, pb, lib, cover, n, enforce_band=band)
+    # POL-AMBIG-03: emitted WITHOUT enforce_positive so name/DOB/address stay equal
+    # (that agreement is the scenario). A weak field still drifts (see m_household_dup).
+    for _ in range(n_pol):
+        cA, eidA, cB, eidB, label, case, corr = lib.m_household_dup()
+        recA, recB = pb.emit_record(cA, eidA), pb.emit_record(cB, eidB)
+        rows.append(pair_row(recA, recB, label, case, corr))
     # ---- negatives: easy (train anchor only) / hard ----
     n_neasy = round(n_non * easy_neg_frac)
     n_nhard = n_non - n_neasy
@@ -1846,18 +2005,18 @@ def _assemble(gen, pb, n_match, n_non, cover_frac, dirty_frac, easy_neg_frac):
     return rows
 
 
-def build_train(gen, pb, n_pairs, ratio=1.5, cover_frac=0.35, dirty_frac=0.25):
+def build_train(gen, pb, n_pairs, ratio=1.5, cover_frac=0.35):
     """Balanced ~1:ratio training corpus (§8.4 difficulty); keeps a 3% easy-negative anchor."""
     n_match = round(n_pairs * (1.0 / (1.0 + ratio)))
-    return _assemble(gen, pb, n_match, n_pairs - n_match, cover_frac, dirty_frac, easy_neg_frac=0.03)
+    return _assemble(gen, pb, n_match, n_pairs - n_match, cover_frac, easy_neg_frac=0.03)
 
 
-def build_test(gen, pb, n_pairs, prevalence=0.10, cover_frac=0.35, dirty_frac=0.25):
+def build_test(gen, pb, n_pairs, prevalence=0.10, cover_frac=0.35):
     """Honest evaluator: realistic prevalence, *identical difficulty construction to
     train* (all named hard cases + SSN bands), on held-out entities, with **all-hard
     negatives** (no random strangers) so precision reflects production."""
     n_match = round(n_pairs * prevalence)
-    return _assemble(gen, pb, n_match, n_pairs - n_match, cover_frac, dirty_frac, easy_neg_frac=0.0)
+    return _assemble(gen, pb, n_match, n_pairs - n_match, cover_frac, easy_neg_frac=0.0)
 
 
 def write_pairs(rows, path):
@@ -1886,8 +2045,6 @@ def main():
                     help="positive fraction in the test set (1:4 -> enough positives for stable per-case recall)")
     ap.add_argument("--overlay-frac", type=float, default=0.20,
                     help="share of each split drawn from the hard-scenario overlay (rest = realistic bulk)")
-    ap.add_argument("--dirty-frac", type=float, default=0.20,
-                    help="share of positives drawn with the dirty-tail messiness multiplier")
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
 
@@ -1902,10 +2059,8 @@ def main():
     v = args.version
 
     # Train and test draw their own fresh entities -> entity-disjoint by construction.
-    train_rows = build_train(gen, pb, args.train_pairs, ratio=args.train_ratio,
-                             dirty_frac=args.dirty_frac)
-    test_rows = build_test(gen, pb, args.test_pairs, prevalence=args.test_prevalence,
-                           dirty_frac=args.dirty_frac)
+    train_rows = build_train(gen, pb, args.train_pairs, ratio=args.train_ratio)
+    test_rows = build_test(gen, pb, args.test_pairs, prevalence=args.test_prevalence)
     write_pairs(train_rows, out / f"synthetic_train_v{v}.csv")
     write_pairs(test_rows, out / f"synthetic_test_v{v}.csv")
 

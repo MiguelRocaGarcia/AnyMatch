@@ -1,7 +1,7 @@
 # python predict_alliance_full.py `
 #       --records_parquet data/alliance/MDM_Population_cleaned_v3_2026_06_11.parquet `
 #       --pairs_parquet   data/alliance/candidate_pairs_v4_2026_06_11.parquet `
-#       --ckpt_dir        saved_models/anymatch_alliance_ft_v2 `
+#       --ckpt_dir        saved_models/anymatch_alliance_ft_v3 `
 #       --output_csv      data/alliance/anymatch_predictions_full.csv `
 #       --chunk_size 2000 --batch_size 32
 
@@ -43,7 +43,7 @@ from data import GPTDataset
 #   python predict_alliance_full.py \
 #       --records_parquet data/alliance/MDM_Population_cleaned_v3_2026_06_11.parquet \
 #       --pairs_parquet   data/alliance/candidate_pairs_v4_2026_06_11.parquet \
-#       --ckpt_dir        saved_models/anymatch_alliance_ft_v2 \
+#       --ckpt_dir        saved_models/anymatch_alliance_ft_v3 \
 #       --output_csv      data/alliance/anymatch_predictions_full.csv \
 #       --chunk_size 2000 --batch_size 32
 # ----------------------------------------------------------------------------
@@ -55,7 +55,7 @@ def parse_args():
     p = argparse.ArgumentParser(description='Resumable batched AnyMatch inference over all candidate pairs.')
     p.add_argument('--records_parquet', required=True, help='Cleaned MDM population parquet (per-record).')
     p.add_argument('--pairs_parquet', required=True, help='Blocking output parquet with PATID_A / PATID_B.')
-    p.add_argument('--ckpt_dir', default='saved_models/anymatch_alliance_ft_v2', help='Trained checkpoint dir.')
+    p.add_argument('--ckpt_dir', default='saved_models/anymatch_alliance_ft_v3', help='Trained checkpoint dir.')
     p.add_argument('--output_csv', required=True, help='Incremental predictions CSV (appended to; resumable).')
     p.add_argument('--chunk_size', type=int, default=2000, help='Pairs scored + flushed to disk per chunk.')
     p.add_argument('--batch_size', type=int, default=32, help='Model forward-pass batch size.')

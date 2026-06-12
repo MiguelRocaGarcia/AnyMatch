@@ -12,8 +12,8 @@ A **patched fork** of [Jantory/anymatch](https://github.com/Jantory/anymatch) (Z
 
 1. **Data prep** (local): `data/preprocess.ipynb` consumes `data/raw/` → produces `data/prepared/<dataset>/{train,valid,test}.csv` + `attr_*.csv`.
 2. **Train** (Colab Pro A100): `anymatch_training.ipynb` runs `loo.py --leaved_dataset_name none` on all 9 datasets; ~30–60 min; checkpoint backed up to Drive at `MyDrive/AnyMatch/checkpoints/anymatch_all9_gpt2_mode4/`. (The previous `anymatch_all9_gpt2/` mode1 checkpoint is kept around for A/B comparison.)
-3. **Fine-tune** (Colab Pro A100): `anymatch_finetuning.ipynb` runs `finetune_alliance.py`, which **resumes from** the all9 mode4 checkpoint and continues training on the synthetic corpus (`data/synthetic/synthetic_train_v2.csv`, early-stopped on `synthetic_test_v2.csv`); ~10–25 min; checkpoint backed up to Drive at `MyDrive/AnyMatch/checkpoints/anymatch_alliance_ft_v2/`. This is the *sequential* (not joint-mix) fine-tune — gentle LR + early stop on the entity-disjoint test.
-4. **Sanity-check inference** (local): `anymatch_synthetic_inference.ipynb` renames the generated `data/synthetic/synthetic_test_v2.csv` (the realistic-distribution evaluator) to the friendly schema (`utils/alliance_schema.prep_paired_df`) and scores it **inline** (the fine-tuned checkpoint ships only `tokenizer.json`, which the slow `GPT2Tokenizer` in `predict_alliance.py` can't load).
+3. **Fine-tune** (Colab Pro A100): `anymatch_finetuning.ipynb` runs `finetune_alliance.py`, which **resumes from** the all9 mode4 checkpoint and continues training on the synthetic corpus (`data/synthetic/synthetic_train_v3.csv`, early-stopped on `synthetic_test_v3.csv`); ~10–25 min; checkpoint backed up to Drive at `MyDrive/AnyMatch/checkpoints/anymatch_alliance_ft_v3/`. This is the *sequential* (not joint-mix) fine-tune — gentle LR + early stop on the entity-disjoint test.
+4. **Sanity-check inference** (local): `anymatch_synthetic_inference.ipynb` renames the generated `data/synthetic/synthetic_test_v3.csv` (the realistic-distribution evaluator) to the friendly schema (`utils/alliance_schema.prep_paired_df`) and scores it **inline** (the fine-tuned checkpoint ships only `tokenizer.json`, which the slow `GPT2Tokenizer` in `predict_alliance.py` can't load).
 5. **Real inference** — two paths, both **inline** (not via `predict_alliance.py`):
    - *Small / sanity batches* (local notebook): `anymatch_alliance_inference.ipynb` joins the blocking output `data/alliance/candidate_pairs_v4_2026_06_11.parquet` with the per-record `data/alliance/MDM_Population_cleaned_v3_2026_06_11.parquet` (**both parquet now**), filters `valid_record=True`, scores `N_PAIRS` pairs inline, and shows diagnostics.
    - *Full population* (CLI, multi-day): `predict_alliance_full.py` — resumable, batched, parquet in → incremental single CSV out, terminal progress logs. This is the production scoring path.
@@ -44,9 +44,9 @@ The zero-shot mode4 checkpoint underperforms on FQHC patient pairs in two specif
 - `synthetic_data_generation/Synthetic-Dataset-Spec.md` — the design doc (now **v0.5**, the single source of truth). **Hybrid** assembly: a realistic entity-first *bulk* (real missingness joint + multi-field §5.8 corruptions + a correlated **dirty tail**) plus a budgeted minority of hard-scenario *overlays* that never force field presence; **two outputs only** (`synthetic_train` balanced ~1:1.5; `synthetic_test` realistic-prevalence honest evaluator with **blocking-survivor-like hard negatives**); entity-disjoint by construction; mode4-oriented; §12 sanity checks. Read it before changing the generator.
 - `synthetic_data_generation/extract_mdm_stats.py` — aggregate-stats extractor (k-anon top-N, missingness, histograms, **within-cluster field agreement**, geo-joint, missingness-pattern joint) from `MDM_Population_cleaned_v1.csv` → `synthetic_data_stats.json`. **Aggregates only — no raw rows.** Run locally; JSON is safe to commit.
 - `synthetic_data_generation/build_pools.py` — **offline-first** vocabulary-pool builder. Bootstraps `pools/*.json` (first/last names, streets, nicknames, initial-expansion) from `synthetic_data_stats.json` + curated supplements; no network/Ollama needed.
-- `synthetic_data_generation/generate_synthetic.py` — the generator (v0.5 hybrid). Correlated entity sampler (geo/missingness joints + pediatric coupling) → realistic **bulk** positives (`apply_calibrated_corruptions`, with an optional `messiness` multiplier for the dirty tail) and **hard negatives** (`make_hard_negative` / `force_shared_key` — two distinct people forced to share one strong key) + a budgeted **overlay** from the §8 `ScenarioLib` (`run_overlay`, with SSN-presence reconciliation on non-SSN-led match scenarios). `build_train` / `build_test` assemble the two files; train and test draw their own fresh entities so they are entity-disjoint by construction. Writes **two** §11 outputs with `_v{N}` versioning. **Byte-reproducible from `--seed`.** Run: `python synthetic_data_generation/generate_synthetic.py --seed 42 --version 2` (~4 s; `--smoke` for a tiny test).
-- `synthetic_data_generation/qa_checks.py` — asserts the §12 checks (incl. realistic-missingness ±3pp, positive multi-corruption heavy-tail, 100% key-sharing test negatives); run after generation: `python synthetic_data_generation/qa_checks.py --version 2`.
-- Outputs (2 files): `synthetic_train_v2.csv` (balanced ~1:1.5, hybrid bulk+overlay) and `synthetic_test_v2.csv` (realistic prevalence, hard negatives only, held-out entities). Provenance (`entity_id_a/b`, `case_type`, `corruptions_applied`) rides inline — no manifest files.
+- `synthetic_data_generation/generate_synthetic.py` — the generator (v0.6 catalog-only-positives). Correlated entity sampler (geo/missingness joints + pediatric coupling). **Positives come entirely from the §8 `ScenarioLib` catalog** — each case anchored on a surviving strong signal, with realistic §7 background drift on top. **Negatives** are blocking-survivor-like **bulk** hard negatives (`make_hard_negative` / `force_shared_keys` — two distinct people forced to share 1–3 strong keys) plus the §8 NM catalog. **v0.6 removed the entity-first bulk *positives* and the `messiness` dirty-tail multiplier** — they produced ~36% of positives with no shared strong identifier (human-disagreeable matches); see Spec §7/§9. `build_train` / `build_test` assemble the two files; train and test draw their own fresh entities so they are entity-disjoint by construction. Writes **two** §11 outputs with `_v{N}` versioning. **Byte-reproducible from `--seed`.** Run: `python synthetic_data_generation/generate_synthetic.py --seed 42 --version 3` (~4 s; `--smoke` for a tiny test).
+- `synthetic_data_generation/qa_checks.py` — asserts the §12 checks (incl. realistic-missingness ±3pp, anchor-survival on positives, 100% key-sharing test negatives); run after generation: `python synthetic_data_generation/qa_checks.py --version 3`.
+- Outputs (2 files): `synthetic_train_v3.csv` (balanced ~1:1.5, catalog positives + hard/easy negatives) and `synthetic_test_v3.csv` (realistic prevalence, hard negatives only, held-out entities). Provenance (`entity_id_a/b`, `case_type`, `corruptions_applied`) rides inline — no manifest files.
 
 Gotchas: pair CSVs use `_l`/`_r` for model columns and `_A`/`_B` (+ `entity_id_a/b`, `case_type`, `corruptions_applied`) for provenance that `df_serializer` skips. `Address_normalized` is emitted **null** to match the real cleaned file (libpostal wasn't run there). Both inference notebooks and `finetune_alliance.py` import the three-name `CANONICAL_RENAMES` from `utils/alliance_schema.py`, so train/serve serialize identical attribute names. The generated `synthetic_{train,test}` CSVs carry **technical** column names (`FirstNM_clean_l`, …); the friendly mode4 rename happens at load time via `prep_paired_df`.
 
@@ -75,10 +75,10 @@ Fine-tune the all9 checkpoint on the synthetic corpus (sequential; A100 recommen
 ```sh
 python finetune_alliance.py \
     --base_checkpoint saved_models/anymatch_all9_gpt2_mode4 \
-    --train_csv data/synthetic/synthetic_train_v2.csv \
-    --valid_csv data/synthetic/synthetic_test_v2.csv \
-    --eval_csv  data/synthetic/synthetic_test_v2.csv \
-    --save_model_path saved_models/anymatch_alliance_ft_v2 \
+    --train_csv data/synthetic/synthetic_train_v3.csv \
+    --valid_csv data/synthetic/synthetic_test_v3.csv \
+    --eval_csv  data/synthetic/synthetic_test_v3.csv \
+    --save_model_path saved_models/anymatch_alliance_ft_v3 \
     --base_model gpt2 --serialization_mode mode4 \
     --lr 1e-5 --epochs 10 --patience 3
 ```
@@ -102,7 +102,7 @@ Score the **full population** with the fine-tuned checkpoint (resumable, parquet
 python predict_alliance_full.py \
     --records_parquet data/alliance/MDM_Population_cleaned_v3_2026_06_11.parquet \
     --pairs_parquet   data/alliance/candidate_pairs_v4_2026_06_11.parquet \
-    --ckpt_dir        saved_models/anymatch_alliance_ft_v2 \
+    --ckpt_dir        saved_models/anymatch_alliance_ft_v3 \
     --output_csv      data/alliance/anymatch_predictions_full.csv \
     --chunk_size 2000 --batch_size 32 --device cuda
 ```
@@ -135,7 +135,7 @@ utils/
 data/
   raw/<dataset>/       # 8 Magellan deepmatcher zips + WDC
   prepared/<dataset>/  # output of preprocess.ipynb
-  synthetic/           # synthetic_{train,test}_v2 (generated; v0.5 hybrid)
+  synthetic/           # synthetic_{train,test}_v3 (generated; v0.6 catalog-only positives)
   alliance/            # candidate_pairs_v4_*.parquet, MDM_Population_cleaned_v3_*.parquet (both parquet)
 docs/
   Data-Cleaning-Guide.md   # MDM cleaning rules (drives synthetic-data conventions)

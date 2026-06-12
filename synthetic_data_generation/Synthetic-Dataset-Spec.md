@@ -6,8 +6,8 @@ Running `python synthetic_data_generation/generate_synthetic.py --seed 42 --vers
 
 | File | Level | Match:non-match | Purpose |
 |---|---|---|---|
-| `synthetic_train_v2.csv` | pair | ~1:1.5 (balanced) | **Training set** for fine-tuning the mode4 checkpoint. Built **hybrid** (§9): a realistic entity-first *bulk* (real missingness joint + multi-field corruptions, plus a dirty tail) with a budgeted minority of hard-scenario *overlays* (§8) so the model sees both the natural distribution and the specific failure modes — SSN as decisive identity, cross-name-field token shuffles, household false-matches. Drawn from the **train** entity partition. |
-| `synthetic_test_v2.csv` | pair | `--test-prevalence`, default 1:4 | **Honest evaluator.** Realistic-ish match prevalence + **hard negatives only** (no random strangers), the **same difficulty construction as train** (SSN bands + every named hard case + key-sharing negatives), realistic missingness + multi-corruption. **Entity-disjoint** from train (§10). 1:4 (not 1:9) keeps enough positives for stable per-`case_type` recall. |
+| `synthetic_train_v3.csv` | pair | ~1:1.5 (balanced) | **Training set** for fine-tuning the mode4 checkpoint. **Positives** come entirely from the §8 scenario catalog (each anchored on a surviving strong signal + realistic §7 background drift); **negatives** are blocking-survivor-like bulk (`NM-HARD-*`, key-sharing) plus the §8 NM catalog. Covers the specific failure modes — SSN as decisive identity, cross-name-field token shuffles, household false-matches. Drawn from the **train** entity partition. (v0.6 removed the entity-first bulk positives + dirty tail; see §9.) |
+| `synthetic_test_v3.csv` | pair | `--test-prevalence`, default 1:4 | **Honest evaluator.** Realistic-ish match prevalence + **hard negatives only** (no random strangers), the **same difficulty construction as train** (SSN bands + every named hard case + key-sharing negatives), realistic missingness + multi-corruption. **Entity-disjoint** from train (§10). 1:4 (not 1:9) keeps enough positives for stable per-`case_type` recall. |
 
 > **Design note (v0.5, 2026-06-09).** This supersedes the earlier four-file, case-first-dominant design. Two findings drove the change: (1) the old training corpus was unrealistically clean — 70% of positives had exactly one corruption and field presence was distorted by forced `ensure_*`/`force_full_ssn` calls — so the model learned brittle single-signal rules; (2) the old `realistic_eval` measured precision against uniformly-random strangers (0% shared DOB/address/phone/SSN), not the hard near-duplicates a matcher faces. The redesign makes realistic entity-first generation the backbone, demotes hard scenarios to budgeted overlays that **never** force field presence, adds a correlated **dirty tail**, and collapses output to the two files above. Goal: an AnyMatch **mode4** model robust enough on very dirty, sparse pairs to emit **silver labels** for unlabeled data.
 
@@ -312,7 +312,7 @@ For each pair of variants drawn from the same entity, apply corruptions. The cor
 - **Sex → use `by_ssn_dob` (~1.5%).** The `by_ssn` 8.5% is almost entirely the SSN-error artifact, not genuine same-person sex flips.
 - **DOB → use `by_ssn` (~13% differ).** `by_ssn_dob` is 100%-exact by construction and unusable here; within that 13%, off-by-one/transpose stay at their measured <0.1% (teaching-only, see §8 DOB note).
 
-**Corruption application model (locked 2026-05-28): independent per-field Bernoulli at the calibrated marginals.** Each field is corrupted independently at its P(differs) target above. We deliberately do **not** synthesize a field-to-field corruption *correlation*, because we have no measured joint-corruption distribution to calibrate one against and inventing it would distort the validated marginals (§12.7). Real "everything is a mess" co-occurrence is instead supplied explicitly by the heavy-drift scenarios (M-MIX-02, M-SSN-11) so the tail is represented without biasing the bulk. **v0.5 update — the messiness multiplier is now ON (dirty tail).** The deferred "messiness" knob is enabled: a budgeted fraction (~15–25%) of positives draw a shared multiplier `m>1` that scales every field's P(differs) up *together*, so corruptions correlate and name+address+phone+DOB drift at once (5+ differing fields). The independent-Bernoulli marginals still govern the un-multiplied bulk; the multiplier only adds the heavy co-occurrence tail (validated by §12 check 8). SSN/last-4 are stable within a true cluster by construction (they're the cluster key), so SSN is never corrupted in match pairs except in the explicit M-SSN-08 / M-L4-03 drift scenarios.
+**Corruption application model (locked 2026-05-28): independent per-field Bernoulli at the calibrated marginals.** Each field is corrupted independently at its P(differs) target above. We deliberately do **not** synthesize a field-to-field corruption *correlation*, because we have no measured joint-corruption distribution to calibrate one against and inventing it would distort the validated marginals (§12.7). Real "everything is a mess" co-occurrence is instead supplied explicitly by the heavy-drift scenarios (M-MIX-02, M-SSN-11) so the tail is represented without biasing the bulk. **v0.6 update — the messiness multiplier (dirty tail) was REMOVED.** The earlier v0.5 "messiness" knob scaled every field's P(differs) up together with no protected anchor; because the §5.8 differ marginals are measured on `by_ssn` clusters (pairs that all share a full SSN) but were applied to the 64% no-SSN bulk, the multiplier manufactured positives that retained **no surviving shared identifier** (different name, DOB, address, phone, and no SSN on either side) yet were labeled match=1 — pairs a human would call non-matches, which is the opposite of the conservative-in-doubt behavior we want. The multiplier and the entity-first bulk *positives* (`M-BULK-*`) are gone. Positives now come **entirely from the §8 scenario catalog**, where every case is anchored on at least one surviving strong signal and the §7 corruption engine still adds realistic *background* drift on top — so the multi-corruption realism the bulk was chasing remains, but with the anchor the bulk discarded. The bulk *negatives* (`NM-HARD-*`, blocking-survivor-like) are correct by construction and were **kept**. SSN/last-4 are stable within a true cluster by construction (they're the cluster key), so SSN is never corrupted in match pairs except in the explicit M-SSN-08 / M-L4-03 drift scenarios.
 
 Corruption types (see §8 for the scenarios that combine these):
 - **Name corruptions:**
@@ -340,6 +340,11 @@ Corruption types (see §8 for the scenarios that combine these):
 
 ## 8. Scenario catalog
 
+> **Quick reference:** for a scannable one-line-per-scenario index of *what each case agrees on, what
+> differs (and how), and what is missing*, see **`Scenario-Catalog.md`** (the plain-English companion).
+> This section keeps the full design rationale and teaching intent; the catalog file is the at-a-glance
+> map. The implemented source of truth is `generate_synthetic.py::ScenarioLib`.
+
 Naming: `<M|NM|EDGE>-<bucket>-<NN>`. Each scenario records:
 - **Teaches:** which behavior this case targets.
 - **Recipe:** how to construct it from an entity (M) or two entities (NM).
@@ -360,149 +365,28 @@ Naming: `<M|NM|EDGE>-<bucket>-<NN>`. Each scenario records:
 
 ### 8.1 Match scenarios (label = 1)
 
-#### No-SSN-led — teach: "without SSN, name-token-union + DOB + corroborating field is the match signal"
+The **per-scenario breakdown** — every case's *agree-on / differs-how / missing* — now lives in
+**`Scenario-Catalog.md`** (generated to mirror `generate_synthetic.py::ScenarioLib` exactly). This
+section keeps only the *teaching theme* per bucket: why it exists and what behavior it targets.
 
-These dominate the real population. The model must comfortably match on name+DOB-led signals alone.
-
-- **M-NOSSN-01 — No-SSN control.** Both sides have identical first/middle/last/DOB/sex/address, no SSN, no last-4. Sanity-check positive for the no-SSN path.
-- **M-NOSSN-02 — No-SSN, address moved.** Same name/DOB/sex; different address (intra-city or cross-city); both sides have no SSN.
-- **M-NOSSN-03 — No-SSN, name-token-stable + phone overlap.** Same name+DOB, no SSN, address differs, phone sets overlap by ≥1.
-- **M-NOSSN-04 — Thin no-SSN record.** Both sides only have first+last+DOB+sex (no address, no phone, no email, no SSN). Agree on those. Sparse but matchable — this is FQHC reality for transient patients.
-- **M-NOSSN-05 — No-SSN with name corruption.** No SSN on either side; DOB matches; one side has a single-character typo on first or last name.
-- **M-NOSSN-06 — No-SSN, DOB clerical drift.** No SSN on either side; name and address agree exactly; DOB off-by-one day or year. Tests the model's tolerance for DOB noise when the *only* anchor is name+address. *Borderline; oversample modestly and verify policy with stakeholders.*
-
-#### SSN-led — strong-signal subset; teach: "valid full-SSN equality ⇒ match (other fields may drift freely)"
-
-- **M-SSN-01 — Identical record (control).** All 11 model fields agree. Sanity-check positive. Small budget; mostly a calibration anchor.
-- **M-SSN-02 — SSN match, name typos.** Same SSN/DOB. Names corrupted by 1–2 single-character typos on one side.
-- **M-SSN-03 — SSN match, missing middle.** Same SSN/DOB. One side has `MiddleNM_clean=null`, other has middle present.
-- **M-SSN-04 — Maiden ↔ married surname.** Same SSN/DOB/first/middle. Last name on side B is a completely different last name drawn from top-N. *Critical for SSN-trumping behavior.*
-- **M-SSN-05 — Moved (different street).** Same SSN/DOB/name. Side B has entirely different address (same city) or different city.
-- **M-SSN-06 — Moved out of state.** Same SSN/DOB/name. Side B in different state + ZIP.
-- **M-SSN-07 — Different phone, different email.** Same SSN/DOB/name/address. Side B has new phone set + new email.
-- **M-SSN-08 — DOB clerical drift.** Same SSN/name. DOB on B has off-by-one day or year. Tests "SSN trumps minor DOB disagreement".
-- **M-SSN-09 — Full SSN ↔ last_4 only.** Side A has full 9-digit SSN; side B has only `last_4_SSN` (full is null). last_4 agrees. Name + DOB agree.
-- **M-SSN-10 — SSN ↔ no SSN at all.** Side A has full SSN; side B has neither. Name + DOB + address agree. Verifies model doesn't *require* SSN to match.
-- **M-SSN-11 — Heavy drift, SSN anchors.** Same SSN. Name has typo + missing middle, DOB has off-by-one, address moved, phone/email changed. Realistic worst-case match.
-
-#### Last-4-led — teach: "last_4_SSN + DOB + name is decisive when full SSN is absent on both sides"
-
-This bucket targets the 14.3% backup-only band where neither side has a full SSN but both have `last_4_SSN`. The naive `last_4` collision rate is 1/10,000 by chance, but conditioned on a name+DOB match it is near-decisive.
-
-- **M-L4-01 — Last-4 + name + DOB match, no full SSN on either side.** The control case for the backup-only band.
-- **M-L4-02 — Last-4 + DOB match, name has typo.** Name has a single-character typo on first or last; last-4 + DOB agree exactly. Match.
-- **M-L4-03 — Last-4 + name match, DOB off-by-one.** Last-4 + name agree; DOB differs by one day/year. Match (last-4 + name is strong; small DOB drift is plausible clerical noise).
-- **M-L4-04 — Asymmetric: full SSN one side, last-4 only the other.** Side A has 9-digit `SSN_clean`; side B has only `last_4_SSN` (full null). `SSN_clean[-4:] == last_4_SSN` on B. Name + DOB agree. *(Pairs that look like this are common when one site collects full SSN and another only collects the last four.)*
-- **M-L4-05 — Asymmetric with name drift.** As M-L4-04 plus one name corruption. Last-4 still anchors.
-
-#### Name-coupling-led — teach: "name field assignment is noise; tokens are signal"
-
-- **M-NAME-01 — Hyphenation variant.** `ANNE-MARIE` ↔ `ANNE MARIE` ↔ `ANNEMARIE` across the first-name slot. Same person.
-- **M-NAME-02 — First/middle swap.** Side A: `(FirstNM=MARIA, MiddleNM=CARMEN)`; side B: `(FirstNM=CARMEN, MiddleNM=MARIA)`. Clerical reassignment.
-- **M-NAME-03 — Two-surname shuffle (Hispanic).** Side A: `(MiddleNM=GARCIA, LastNM=LOPEZ)`; side B: `(MiddleNM=null, LastNM=GARCIA LOPEZ)`. Common when Hispanic patient registers at different clinics.
-- **M-NAME-04 — Two-surname collapse to one.** Side A: `LastNM=GARCIA LOPEZ`; side B: `LastNM=LOPEZ` (or `GARCIA`). Same person dropped a surname.
-- **M-NAME-05 — Vietnamese name-order swap.** Side A: `(FirstNM=NGUYEN, LastNM=THI MAI)`; side B: `(FirstNM=THI MAI, LastNM=NGUYEN)`. Native vs US order.
-- **M-NAME-06 — Middle-initial only.** Side A: `MiddleNM=ANNE`; side B: `MiddleNM=A`. Same person.
-- **M-NAME-07 — Compound first dropped.** Side A: `FirstNM=MARIA CARMEN`; side B: `FirstNM=MARIA`. Same person, lazy entry.
-- **M-NAME-08 — Generational suffix appears/absent.** Side A: `LastNM=SMITH JR` (post-cleaning collapse); side B: `LastNM=SMITH, SuffixNM=JR`. Or one side has no suffix at all.
-- **M-NAME-08b — Suffix in wrong slot.** Real data has 45 records with `JR` in `MiddleNM_clean` while `SuffixNM_clean` is null (the LastNM-trailing-` JR`/`SR` form is removed by the cleaning step at the source, so it never appears post-clean). Side A: `MiddleNM=JR` (or `SR`/`III`); side B: `SuffixNM=JR` with middle clean (or null). Same SSN/DOB/first/last token. Same person; clerical-slot misplacement that survived cleaning.
-- **M-NAME-09 — Nickname.** `ROBERT↔BOB`, `WILLIAM↔BILL`, `ELIZABETH↔BETH/LIZ`, `MICHAEL↔MIKE`, `JOSEPH↔JOE`, `JOSE↔PEPE` (Spanish), `FRANCISCO↔PACO`. Limited curated mapping table — same person.
-- **M-NAME-10 — Typo: single-char substitute.** `ROCA` ↔ `ROCQ`. Same SSN/DOB.
-- **M-NAME-11 — Typo: transposition.** `SMITH` ↔ `SMIHT`. Same SSN/DOB.
-- **M-NAME-12 — Typo: insertion/deletion.** `JOHNSON` ↔ `JOHNSOON` / `JONSON`. Same SSN/DOB.
-- **M-NAME-13 — Diacritical loss (already cleaned).** Pre-cleaning, side A was `MUÑOZ` and B was `MUNOZ`; both post-clean to `MUNOZ`. Included as a control: should appear identical at our level. (Tests our cleaning fidelity, not the model.)
-
-#### DOB-led
-
-> **Calibration note (§5.8):** in real same-person pairs DOB matches exactly ~87% of the time, and when it differs it is almost always a *substantial* gap, not a tidy off-by-one (off-by-one-day/year and month-day-transpose are each <0.1%). M-DOB-02/03/04 below are therefore **teaching devices for tolerance**, not realistic frequencies — oversample them in the fine-tune corpus but keep them near their true (tiny) rate in the realistic-eval.
-
-- **M-DOB-01 — Identical DOB, otherwise typical.** Control.
-- **M-DOB-02 — Month-day transposition.** `1985-01-15 ↔ 1985-10-15` (only valid when day ≤ 12). Same SSN/name.
-- **M-DOB-03 — Off-by-one year.** `1985-04-12 ↔ 1986-04-12`. Same SSN/name.
-- **M-DOB-04 — Off-by-one day.** Same SSN/name.
-- **M-DOB-05 — DOB null on one side.** Same SSN/name; side B `BirthDT_clean=null`.
-
-#### Address-led (still same entity)
-
-- **M-ADDR-01 — Apartment added/removed.** Same building. `AddressLine2_clean` toggles between null and `APT 4B`.
-- **M-ADDR-02 — Apartment changed.** Same street; apt differs (moved within building).
-- **M-ADDR-03 — Address-line2 absorbed into line1.** Side A: `123 MAIN ST` + `APT 5`; side B: `123 MAIN ST APT 5` + null line2. Same address.
-- **M-ADDR-04 — House-number typo.** `12345 MAIN ST ↔ 12354 MAIN ST`. Same SSN.
-- **M-ADDR-05 — Street-suffix variants.** Pre-cleaning `MAIN STREET` vs `MAIN ST`; both should normalize to `MAIN ST`. Control case.
-
-#### Phone / email / sex drift
-
-- **M-PHONE-01 — Phone overlap, partial.** Side A has 2 phones, side B has 2 phones; 1 overlaps. Same person.
-- **M-PHONE-02 — Phones disjoint, new number.** Same SSN/name/DOB; phones entirely different.
-- **M-EMAIL-01 — Email changed.** New email, otherwise same.
-- **M-EMAIL-02 — One-char domain typo.** Real-data typos observed: `gmail.com ↔ gamil.com`, `gmail.com ↔ gmai.com`, `parkwestmed.com ↔ parkwestmed.ez`. Local part identical, domain has a one-character insertion / deletion / substitution / transposition. Otherwise identical record. Teach the model to treat this as the same email.
-- **M-SEX-01 — Sex disagreement (clerical).** Same SSN/DOB/name/address; sex flipped on one side. Rare in real data but it happens; label remains match because SSN is decisive.
-- **M-SEX-02 — OTHER vs male/female.** Real data has 374 records (`OTHER`, 0.3%). Side A `SexAtBirthDSC=OTHER`, side B `MALE` or `FEMALE`. Same SSN/name/DOB. Match. Specifically teaches the model that the `OTHER` value exists and is a valid pairing across sites.
-
-#### Pediatric — teach: "constrained-identifier pediatric records still match on the few fields they have"
-
-DOB years 2010s+2020s account for ~12% of records. Pediatric patients (especially under 5) have a constrained identifier set: typically no SSN, no email of their own, phone is the parent's, address is the parent's. Treat as its own bucket because the *missingness shape* is different from adults.
-
-- **M-PED-01 — Pediatric thin match.** Both sides: same first+middle+last, same DOB (in 2010s or 2020s), same sex, same parent address; no SSN, no last-4, no email. Phone may be present (parent's) and overlap. Match.
-- **M-PED-02 — Pediatric with last-4.** As M-PED-01 plus `last_4_SSN` set and equal on both sides. Match.
-- **M-PED-03 — Pediatric name-token drift.** Pediatric pair (DOB 2010s+). Same DOB+address+sex; name has 1 token-shuffle (e.g., MiddleNM promoted to FirstNM compound, or one side has only FirstNM+LastNM with MiddleNM null). Same person. Match.
-- *(Newborn/placeholder scenarios — `BABY GIRL <LASTNM>` and similar — are excluded: they are flagged `valid_record=False` by the cleaning rules in `docs/Data-Cleaning-Guide.md` and never reach the model at inference time. If FQHCs need to resolve newborn-placeholder pairs, that has to be addressed upstream in cleaning, not by the model.)*
-
-#### Mixed / realistic
-
-- **M-MIX-01 — Two corruptions.** Random pair of one name + one address corruption applied. Bulk of the entity-first match population.
-- **M-MIX-02 — Three corruptions.** Heavier drift; SSN or last_4 still anchors.
-- **M-MIX-03 — Thin records.** Both sides have only first+last+DOB+sex. Agree on all. Sparse but matchable.
+- **No-SSN-led (`M-NOSSN-*`)** — without SSN, the match signal is name-token-union + DOB + one corroborating field. The dominant real population; the model must match comfortably here.
+- **SSN-led (`M-SSN-*`)** — a valid full-SSN equality decides the pair; name / address / DOB / contact may all drift freely (maiden↔married, moves, clerical noise).
+- **Last-4-led (`M-L4-*`)** — when no full SSN is present, `last_4_SSN` + name + DOB is near-decisive; includes the asymmetric full-vs-last-4 cross-site case.
+- **Name-coupling (`M-NAME-*`)** — name-field *assignment* is noise, tokens are signal: cross-field shuffles, two-surname swaps/collapses, order swaps, initials, nicknames, suffix-slot leaks, typos.
+- **Drift (`M-ADDR-/M-DOB-/M-PHONE-/M-EMAIL-/M-SEX-/M-ZIP-/M-PED-*`)** — single-field tolerance: address moves, DOB clerical drift, phone/email churn, sex `OTHER`, pediatric constrained-identifier matches.
+- **Mixed (`M-MIX-*`)** — several corruptions at once with last-4/SSN still anchoring; the realistic messy tail.
 
 ### 8.2 Non-match scenarios (label = 0)
 
-#### Easy negatives
+Per-scenario detail in **`Scenario-Catalog.md`**. Themes:
 
-- **NM-EASY-01 — Fully random.** Two entities, no shared field beyond ambient base rates.
-- **NM-EASY-02 — Same state only.** Both IL, otherwise unrelated.
-
-#### Hard household negatives
-
-- **NM-HH-TWIN — Twin (same DOB, same address, same last name).** Different first name, different SSN, same sex or different sex.
-- **NM-HH-TRIPLET-LIKE — Same DOB + same address but different last name.** Cohabiting unrelated friends born same day. Edge case.
-- **NM-HH-JR-SR — Jr / Sr same household.** Side A: `FirstNM=ROBERT`, `LastNM=SMITH`, `SuffixNM=null`, parent DOB. Side B: `FirstNM=ROBERT`, `LastNM=SMITH`, `SuffixNM=JR`, child DOB. Same address. Different SSN. **Hardest non-match category.**
-- **NM-HH-SIBLING — Siblings.** Same `LastNM_clean`, same address, similar DOBs (within ±10 years), different first name, different SSN.
-- **NM-HH-PARENT-CHILD — Parent / child.** Same `LastNM_clean`, same address, different first name, DOBs differ by 15–40 years.
-- **NM-HH-SPOUSE — Spouses / partners.** Same address, overlapping phones, different last name, different DOB, different SSN.
-- **NM-HH-ROOMMATE — Roommates.** Same address only; nothing else in common.
-
-#### Common-name collisions (Chicago is full of these)
-
-- **NM-COMMON-01 — Same name, same city, different DOB.** `(JOHN SMITH, CHICAGO)` × 2. Different SSN, different DOB by years, different address.
-- **NM-COMMON-02 — Same name, same ZIP.** Tighter geo but still different person.
-- **NM-COMMON-03 — Hispanic surname collision.** Top-N two-surname pairs are not unique. `(MARIA GARCIA LOPEZ)` × 2, different DOB/SSN.
-- **NM-COMMON-04 — Top-ZIP common name collision.** Exploits the Chicago ZIP concentration (`60639`/`60625`/`60640`/`60651`/`60647` each hold 4–7k records). Same `FirstNM_clean` + same `LastNM_clean` + same `ZipCD_clean_base` (one of the top Chicago ZIPs). Different DOB (by ≥5 years) + different SSN + different street. Far more common in production than the looser NM-COMMON-02 — and the model needs to weight ZIP correctly (a populous ZIP is a weak signal).
-- **NM-COMMON-05 — Same name + same Chicago area code.** Same first+last, both have a `773`/`312`/`708` primary phone but the *full number* differs. Different DOB + SSN. Teach: area-code overlap is not phone overlap.
-
-#### SSN-related hard negatives (critical: don't false-match on shared data-quality artifacts)
-
-- **NM-SSN-01 — Last-4 collision.** Side A and B have the same `last_4_SSN` (1/10000 by chance), full SSN missing on both. Different name, different DOB. **Teach: last-4 alone isn't enough.**
-- **NM-SSN-02 — Last-4 collision + same first letter of name.** Slightly harder version of the above.
-- **NM-SSN-03 — Single-digit SSN-typo collision.** Side A's clerk typed an extra '0' into the SSN, which happens to equal side B's real SSN. Different name/DOB. Tests: don't blindly trust SSN equality if name+DOB are wildly different. (Counterweight to M-SSN-* — model must learn SSN is *strong*, not infallible.)
-- **NM-SSN-04 — Same SSN, opposite sex, wildly different DOB.** Likely data-entry error in SSN on one side. Different person. Label = 0. Rare; include modest count.
-- **NM-SSN-05 — Full SSN vs *mismatching* last-4.** Side A has full 9-digit `SSN_clean`; side B has only `last_4_SSN`, and `SSN_clean[-4:] != last_4_SSN`. Name + DOB also disagree. **Teach the SSN↔last-4 coupling in the negative direction**: a last-4 that contradicts the other side's full SSN *kills* the SSN signal rather than being ignored. Counterpart to the positive M-L4-04 (full SSN ↔ agreeing last-4 ⇒ match); without this the model only ever learns last-4 *agreement* helps, never that last-4 *disagreement* against a full SSN hurts.
-
-#### Identity-fragment overlap
-
-- **NM-IDF-01 — Shared shelter / group-home address.** Same `AddressLine1_clean`, same city/state/ZIP; different name + DOB + SSN.
-- **NM-IDF-02 — Shared family phone.** Same primary phone, different name + DOB + SSN.
-- **NM-IDF-03 — Shared family email.** `family@gmail.com` style — different name + DOB.
-- **NM-IDF-04 — Shared address + shared phone.** Two unrelated tenants who use one landline. Stronger lure, still NM.
-
-#### Pediatric non-matches
-
-- **NM-PED-01 — Pediatric siblings.** Both DOBs in 2010s+/2020s, within ±5 years of each other. Same `LastNM_clean`, same parent address, same primary phone. Different first name + different SSN/last-4 (when present). Different person — hardest pediatric NM.
-- **NM-PED-02 — Pediatric same-DOB unrelated.** Two unrelated children with the same DOB (same daycare, same school) at the same address (multi-family building). Different last name. Different SSN/last-4. Different person.
-
-#### Boundary cases
-
-- **NM-BND-01 — Thin records, disagree on name.** Both sides only have first+last+DOB+sex. First or last name differs by more than a typo. Different person. Tests: don't fall back to "almost-empty = match".
-- **NM-BND-02 — Thin records, disagree on DOB.** Both sides only have first+last+DOB+sex. Names agree exactly (common-name pair); DOB differs by years. Different person. Counter-balance to M-NOSSN-04.
+- **Easy (`NM-EASY-*`)** — random strangers / same-state-only; a small train-only anchor.
+- **Household (`NM-HH-*`)** — same address, different person: twins, Jr/Sr, siblings, parent/child, spouses, roommates, cousins. The hardest precision pressure.
+- **Common-name (`NM-COMMON-*`)** — popular first+last collisions (often same city/ZIP/area-code); teaches that a populous ZIP or a shared area code is a weak signal.
+- **SSN-collision (`NM-SSN-*`)** — shared last-4, last-4+DOB, or a typo'd full-SSN collision between different people; plus full-SSN vs *mismatching* last-4 (negative coupling). Teaches SSN is strong, not infallible.
+- **Identity-fragment (`NM-IDF-*`)** — shared shelter address, family phone, family email, or address+phone among unrelated people.
+- **Pediatric (`NM-PED-*`)** — pediatric siblings / same-DOB unrelated children at one address.
+- **Boundary (`NM-BND-*`)** — thin records that disagree on name or on DOB; counter-balance to the thin no-SSN positive.
 
 ### 8.3 Edge / policy cases (label requires explicit decision)
 
@@ -518,19 +402,10 @@ These are scenarios where the *correct* label is ambiguous or depends on the ope
 
 **Difficulty contract (v0.5).** Every named scenario below and in §8.1–§8.2 is filled to a **per-scenario quota** by the enumerated overlay, so the corpus contains **many pairs of each** (hundreds at the 40k scale), not one-offs. On top of that, the bulk supplies the realistic volume. Two global rules now govern *all* positives: (1) **no identical pairs** — every positive has ≥1 corruption; (2) **SSN-band quota** — ≤5% have matching full SSN on both sides (easy), ~15% match on last-4 only (full SSN absent), and **~80% have no usable SSN match** (at least one of full-SSN / last-4 missing or non-matching), forcing resolution on name+DOB+address+phone. Address line1 matches in only ~12–15% of positives (high-mobility FQHC population; cf. §5.8 line1-exact 28.8% measured on the SSN-having stable subpopulation).
 
-**Additional MATCH hard cases (added v0.5):**
-- **M-NAME-13 — First name to initial.** `JOHN` ↔ `J` (clerk recorded an initial). Counterpart to the middle-initial case.
-- **M-NAME-14 — Name truncation.** Long name cut by a field-length limit (`MASSIMILIANO` → `MASSIMILIAN`).
-- **M-NAME-15 — Cross-language given-name variant.** `GUILLERMO` ↔ `WILLIAM`, `JOSE` ↔ `JOSEPH`, `JESUS` ↔ `JESSE` (bilingual records); seeded via the nickname/equivalence pool.
-- **M-NAME-16 — Double-space / concatenation.** `DE LA CRUZ` ↔ `DELACRUZ`, `MARY ANN` ↔ `MARYANN`.
-- **M-ADDR-05 — Move within ZIP.** New street, same ZIP/city (very common churn).
-- **M-ADDR-06 — Directional / abbreviation drift.** `123 N MAIN ST` ↔ `123 NORTH MAIN STREET`.
-- **M-ZIP-01 — ZIP-only drift.** Same street, ZIP changed (data-entry or boundary correction).
-
-**Additional NON-MATCH hard cases (added v0.5):**
-- **NM-COMMON-06 — Same name + adjacent DOB.** Same first+last, DOB off by 1–3 days/years (looks like a DOB typo but is a different person).
-- **NM-HH-COUSIN — Cousins.** Same surname, same city/ZIP, different DOB and address.
-- **NM-SSN-06 — Same last-4 + same DOB, different name.** The collision-heavy `by_last4_dob` cluster (§5.7) — shared backup-SSN fragment is *not* identity.
+The additional hard cases (`M-NAME-13/14/16/17`, `M-ADDR-05/06`, `M-ZIP-01`, `NM-COMMON-06/07`,
+`NM-HH-COUSIN`, `NM-SSN-06`, `NM-IDF-05`) are listed with their full agree / differs / missing breakdown
+in **`Scenario-Catalog.md`**, which also records the v0.6 merges (`M-NAME-15`→`M-NAME-09`, `M-MIX-03`→
+`M-NOSSN-04`, the `M-L4-04`/`M-SSN-09` consolidation).
 
 **Test set mirrors train (v0.5).** `synthetic_test` uses the **identical difficulty construction** as `synthetic_train` — the same SSN bands, the same enumerated hard-scenario coverage (so every named case above is *measured*, not just trained), and the same hard (key-sharing) negatives — drawn from **held-out entities** and at **`--test-prevalence` (default 1:4)**. The only differences from train are prevalence, the all-hard negatives (no easy anchor), and the disjoint entity pool. This makes the test both realistic (production-like prevalence + hard negatives) and diagnostic (per-`case_type` recall is readable because each scenario is present).
 
@@ -554,20 +429,23 @@ passes through the §7 corruption engine so each side is independently messy, an
 its one defining transformation on top. This is the fix for the old corpus where forced `ensure_*` /
 `force_full_ssn` calls and single-transformation scenarios made records too clean and field-rich.
 
-**Two pair sources, mixed in both files:**
-- **Bulk (entity-first, ~75–85%).** Sample entities at realistic K / missingness / geo (§6).
-  *Positives* = within-entity variant pairs from the §7 engine (independent per-field corruptions at the
-  §5.8 marginals → naturally 2–3 simultaneous differences). *Negatives* = cross-entity pairs that
-  **share ≥1 strong blocking field** (surname / DOB / address / phone / last-4), each side independently
-  corrupted — i.e. blocking-survivor-like, never random strangers.
-- **Overlay (hard scenarios, ~15–25%).** The §8 catalog, refactored: start from a naturally-missing,
-  already-corrupted variant pair; apply only the scenario's defining transformation; `ensure_<field>`
-  only for that scenario's own field. Guarantees rare structural cases (name-order swaps, suffix-slot,
-  Jr/Sr, last-4 collisions, full-vs-last-4 SSN asymmetry) appear at a learnable count.
+**Pair sources (v0.6):**
+- **Positives — scenario catalog only.** Every positive is a §8 catalog case: start from a
+  naturally-missing variant pair, apply the scenario's defining transformation, `ensure_<field>` only for
+  that scenario's own field, and let the §7 engine add realistic *background* drift on top. Each case is
+  therefore anchored on at least one surviving strong signal (matching SSN, last-4, address, phone, or an
+  exact/near-exact name + DOB) — there is no entity-first bulk positive that can drift to zero residual
+  signal. Catalog cases are distributed across the §8.4 SSN bands (5/15/80) so the no-SSN path dominates.
+- **Negatives — bulk + catalog.** *Bulk negatives* = cross-entity pairs forced to **share ≥1 strong
+  blocking field** (surname / DOB / address / phone / last-4), each side independently corrupted — i.e.
+  blocking-survivor-like, never random strangers (`NM-HARD-*`). *Catalog negatives* = the §8 NM scenarios
+  (household, common-name, identity-fragment, etc.). Bulk negatives are correct by construction (two
+  genuinely different people), so heavy drift on them is always fine.
 
-**Dirty tail (§7).** A budgeted fraction of positives (~15–25%) get a shared **messiness multiplier**
-that *correlates* corruptions so name + address + phone + DOB drift together (5+ differing fields),
-plus thin `N/A`-heavy records — the "everything is a mess at once" tail the marginals alone miss.
+**Removed in v0.6 — entity-first bulk positives + dirty tail.** The v0.5 bulk *positives* and the
+messiness multiplier transplanted `by_ssn`-calibrated drift onto no-SSN pairs with no protected anchor,
+producing ~36% of positives with no shared strong identifier and ~9% sharing essentially nothing — pairs
+a human would reject. Both are gone; positives now come exclusively from the anchored catalog (above).
 
 ### 9.1 Training set — `synthetic_train_vN.csv`
 
@@ -658,7 +536,7 @@ Assertions the generator must satisfy and a notebook verifies:
 5. **Entity disjointness.** No `entity_id` appears in both `synthetic_train` and `synthetic_test`.
 6. **No PHI leakage.** No row matches anything in real `MDM_Population_cleaned_v1.csv` (a hash-set check on a few high-cardinality fields). The point of synthesis is that real persons cannot be recovered.
 7. **Realistic missingness (v0.5 — the key fix).** Per-field **presence**, measured by stacking both `_l` and `_r` sides of every pair, falls within **±3** absolute percentage points of the measured §5 marginals for each field below. This is the check the old corpus failed (forced `ensure_*` over-populated SSN/middle/email).
-8. **Multi-corruption profile (v0.5 — the other key fix).** Among positives, the distribution of *differing-field count* must have a real heavy tail — mean ≈ 2–3 differing fields, **not** a 70% one-corruption spike — with a non-trivial ≥5-field "dirty tail" share. Validate against the §5.8 within-cluster differ profile.
+8. **Multi-corruption profile.** Among positives, the distribution of *differing-field count* must have a real spread — mean ≈ 2–3 differing fields, **not** a 70% one-corruption spike. The heavy co-occurrence now comes from the §8 heavy-drift catalog cases (M-MIX-02, M-SSN-11) plus realistic §7 background drift on every case, **not** from a messiness multiplier (removed in v0.6). **Anchor-survival (v0.6):** every positive must retain ≥1 shared strong signal (matching SSN / last-4 / address / phone, or exact-or-near name + DOB) — no positive drifts to zero residual signal.
 9. **Hard negatives only in test.** **100%** of `synthetic_test` non-match pairs share ≥1 strong blocking field (surname / DOB / address / phone / last-4). No random-stranger negatives in the test set.
 10. **Distribution sanity vs `synthetic_data_stats.json`.** Per-record marginals (stacked sides) fall within ±3 absolute percentage points of the measured §5 values for each of:
     - `FirstNM_clean` / `LastNM_clean` / `BirthDT_clean` presence (~99% expected).
