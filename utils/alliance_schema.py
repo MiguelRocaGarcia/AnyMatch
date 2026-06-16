@@ -73,7 +73,10 @@ def serialize_set_field(x):
     NaN. Sorting makes the output canonical so two records with the same tokens
     in different order serialize identically.
     """
-    if isinstance(x, (set, list, tuple)):
+    # Live collection (set/list/tuple) or a parquet-native array (numpy ndarray /
+    # pyarrow list). Check for the iterable BEFORE pd.isna, which raises
+    # "truth value of an array is ambiguous" on a multi-element array.
+    if isinstance(x, (set, list, tuple)) or (hasattr(x, '__len__') and not isinstance(x, (str, bytes))):
         return ' '.join(sorted(str(t) for t in x if t and str(t).lower() != 'nan'))
     if pd.isna(x):
         return ''
