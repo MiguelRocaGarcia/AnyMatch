@@ -1,0 +1,4 @@
+# Extra dependency for the deterministic rule engine (on top of the AnyMatch env:
+# pandas, numpy, scikit-learn). jellyfish provides Jaro-Winkler + Levenshtein for
+# the name/email comparators.
+jellyfish>=1.0
