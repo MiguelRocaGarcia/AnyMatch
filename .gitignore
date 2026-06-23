@@ -8,3 +8,8 @@ utils/__pycache__
 __pycache__
 .DS_Store
 data/silver_labels/silver_labels_v1_2026_06_21.csv
+# PHI-derived gold-label review stores (labeler.py writes these)
+gold_labels.csv
+gold_labeling/gold_labels.csv
+gold_review.csv
+**/*.csv.tmp
