@@ -7,3 +7,4 @@ data/alliance/*
 utils/__pycache__
 __pycache__
 .DS_Store
+data/silver_labels/silver_labels_v1_2026_06_21.csv
