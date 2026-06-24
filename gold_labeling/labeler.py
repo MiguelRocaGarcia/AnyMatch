@@ -6,7 +6,7 @@ Usage from the notebook (cwd = gold_labeling/):
     from labeler import launch_labeler, load_labels, apply_labels, label_summary, stop_labeler
 
     subset = pairs[(pairs.SSN_clean_A == pairs.SSN_clean_B) & (pairs.silver_label == False)]
-    launch_labeler(subset)          # opens a browser tab; writes gold_labels.csv on every click
+    launch_labeler(subset)          # opens a browser tab; writes data/gold_labels/gold_labels.csv
     ...
     stop_labeler()                  # shut the server down when done
 
@@ -33,6 +33,8 @@ import datetime
 import html
 import json
 import os
+import socket
+import sys
 import threading
 import webbrowser
 
@@ -48,8 +50,30 @@ DEFAULT_FIELDS = [
 ]
 STORE_COLS = ['PATID_A', 'PATID_B', 'gold_label', 'ambiguous_pair', 'reviewed_at']
 
-# Track running servers by port so re-launching cleanly replaces the old one.
-_RUNNING: dict[int, object] = {}
+# Default store lives in data/gold_labels/ (anchored to this file, so it is the same
+# location no matter what the notebook's working directory happens to be).
+_HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_STORE = os.path.normpath(os.path.join(_HERE, '..', 'data', 'gold_labels', 'gold_labels.csv'))
+
+# Track running servers by port so re-launching cleanly replaces the old one. Stashed on the
+# `sys` module (never reloaded) so the registry survives `importlib.reload(labeler)` in the
+# notebook -- otherwise a reloaded module would orphan the old server still holding the port.
+_RUNNING: dict = getattr(sys, '_anymatch_labeler_servers', None)
+if _RUNNING is None:
+    _RUNNING = {}
+    sys._anymatch_labeler_servers = _RUNNING
+
+
+def _port_free(host: str, port: int) -> bool:
+    """True if `port` can be bound right now (nothing actively listening on it)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind((host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
 
 
 # --------------------------------------------------------------------------- helpers
@@ -134,6 +158,9 @@ class LabelStore:
             return cur
 
     def _flush(self):
+        parent = os.path.dirname(self.path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         rows = [{'PATID_A': a, 'PATID_B': b,
                  'gold_label': v.get('gold_label'),
                  'ambiguous_pair': bool(v.get('ambiguous_pair', False)),
@@ -146,14 +173,14 @@ class LabelStore:
 
 
 # --------------------------------------------------------- notebook-side convenience
-def load_labels(store_path: str = 'gold_labels.csv') -> pd.DataFrame:
+def load_labels(store_path: str = DEFAULT_STORE) -> pd.DataFrame:
     """Read the sparse store as a DataFrame (empty frame with the right columns if absent)."""
     if os.path.exists(store_path):
         return pd.read_csv(store_path, dtype={'PATID_A': 'string', 'PATID_B': 'string'})
     return pd.DataFrame(columns=STORE_COLS)
 
 
-def apply_labels(df: pd.DataFrame, store_path: str = 'gold_labels.csv') -> pd.DataFrame:
+def apply_labels(df: pd.DataFrame, store_path: str = DEFAULT_STORE) -> pd.DataFrame:
     """Left-merge gold_label + ambiguous_pair from the store onto a pairs DataFrame.
 
     Idempotent and order-independent -- run any time to refresh `df` from the store.
@@ -167,7 +194,7 @@ def apply_labels(df: pd.DataFrame, store_path: str = 'gold_labels.csv') -> pd.Da
     return out
 
 
-def label_summary(store_path: str = 'gold_labels.csv') -> dict:
+def label_summary(store_path: str = DEFAULT_STORE) -> dict:
     """Counts of match / no_match / ambiguous in the store."""
     s = load_labels(store_path)
     return {
@@ -226,14 +253,20 @@ _PAGE = r"""<!doctype html>
  button.lab.no_match.active{ background:#D50000; color:#fff; border-color:#D50000; }
  button.lab.amb.active     { background:#FB8C00; color:#fff; border-color:#FB8C00; }
  button.lab.ok.active      { background:#607D8B; color:#fff; border-color:#607D8B; }
- .controls .silver { font-size:11px; color:#555; margin-top:2px; }
- .controls .ids { font-size:10px; color:#999; margin-top:6px; word-break:break-all; }
+ .silverbar { flex:0 0 auto; width:16px; display:flex; align-items:center; justify-content:center; }
+ .silverbar span { writing-mode:vertical-rl; transform:rotate(180deg);
+                   font-size:10px; font-weight:bold; color:#fff; letter-spacing:1px; }
+ .silverbar.silver-true  { background:#00E676; }
+ .silverbar.silver-false { background:#FF1744; }
+ .silverbar.silver-null  { background:#bdbdbd; }
  .comp { overflow-x:auto; flex:1; }
  table.cmp { border-collapse:collapse; font-size:11px; }
  table.cmp th { font-size:10px; color:#666; padding:2px 6px; text-align:left; white-space:nowrap; }
  table.cmp td { padding:2px 6px; white-space:nowrap; }
  td.equal { background:#a8e6a3; } td.diff { background:#f4a8a8; }
  td.one-missing { background:#fff3a3; } td.both-missing { background:#d3d3d3; }
+ td.patid { background:#e0e0e0; color:#777; font-size:10px; }
+ th.patid { color:#999; }
  td.side { font-weight:bold; background:#fff; }
 </style></head>
 <body>
@@ -282,10 +315,13 @@ function setAmb(i, val){
 }
 
 function rowHTML(p, i){
-  const head = '<tr><td class="side"></td>' + COLS.map(c=>`<th>${esc(c)}</th>`).join('') + '</tr>';
+  const head = '<tr><td class="side"></td>' + COLS.map(c=>`<th>${esc(c)}</th>`).join('') +
+    '<th class="patid">PATID</th></tr>';
   const side = s => `<tr><td class="side">${s}</td>` +
-    p.fields.map(f=>`<td class="${f.cls}">${esc(s==='A'?f.a:f.b)}</td>`).join('') + '</tr>';
-  const sv = p.silver_label===null ? '&mdash;' : p.silver_label;
+    p.fields.map(f=>`<td class="${f.cls}">${esc(s==='A'?f.a:f.b)}</td>`).join('') +
+    `<td class="patid">${esc(s==='A'?p.patid_a:p.patid_b)}</td></tr>`;
+  const svCls = p.silver_label===true ? 'silver-true' : p.silver_label===false ? 'silver-false' : 'silver-null';
+  const svTxt = p.silver_label===null ? '?' : ('silver ' + p.silver_label);
   return `
   <div class="controls">
     <div class="btnrow">
@@ -296,9 +332,8 @@ function rowHTML(p, i){
       <button class="lab amb ${p.ambiguous_pair?'active':''}" onclick="setAmb(${i},true)">Ambiguous</button>
       <button class="lab ok ${!p.ambiguous_pair?'active':''}" onclick="setAmb(${i},false)">OK</button>
     </div>
-    <div class="silver">silver: <b>${sv}</b></div>
-    <div class="ids">${esc(p.patid_a)}<br>${esc(p.patid_b)}</div>
   </div>
+  <div class="silverbar ${svCls}"><span>${svTxt}</span></div>
   <div class="comp"><table class="cmp">${head}${side('A')}${side('B')}</table></div>`;
 }
 
@@ -334,7 +369,7 @@ renderAll();
 
 
 # --------------------------------------------------------------------------- server
-def launch_labeler(df: pd.DataFrame, fields=None, store_path: str = 'gold_labels.csv',
+def launch_labeler(df: pd.DataFrame, fields=None, store_path: str = DEFAULT_STORE,
                    host: str = '127.0.0.1', port: int = 8765, open_browser: bool = True,
                    max_pairs: int = 3000):
     """Start the labeling web app for `df` (a pairs-shaped DataFrame) and open a browser tab.
@@ -384,17 +419,23 @@ def launch_labeler(df: pd.DataFrame, fields=None, store_path: str = 'gold_labels
             pass
         del _RUNNING[port]
 
-    # find a free port starting at `port`
+    # find a free port starting at `port`. Probe with a plain socket first: werkzeug's
+    # make_server prints to stderr and calls sys.exit(1) (raising SystemExit, not OSError)
+    # when the port is busy, so we avoid calling it on an occupied port.
     server = None
+    last_err = None
     for p in range(port, port + 20):
+        if not _port_free(host, p):
+            continue
         try:
             server = make_server(host, p, app, threaded=True)
             port = p
             break
-        except OSError:
+        except (OSError, SystemExit) as e:  # lost a race for the port; try the next one
+            last_err = e
             continue
     if server is None:
-        raise RuntimeError(f'No free port in {port}..{port + 19}')
+        raise RuntimeError(f'No free port in {port}..{port + 19} ({last_err})')
 
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
@@ -410,9 +451,12 @@ def launch_labeler(df: pd.DataFrame, fields=None, store_path: str = 'gold_labels
     return url
 
 
-def stop_labeler(port: int = 8765):
-    """Shut down the labeling server on `port` (or all servers if port is None)."""
+def stop_labeler(port: int = None):
+    """Shut down the labeling server on `port` (default: all running servers)."""
     ports = list(_RUNNING) if port is None else [port]
+    if not ports:
+        print('[labeler] no servers running')
+        return
     for p in ports:
         srv = _RUNNING.pop(p, None)
         if srv is not None:
