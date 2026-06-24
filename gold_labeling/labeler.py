@@ -29,6 +29,7 @@ PHI: the rendered page contains real patient values in the browser DOM. The serv
 """
 from __future__ import annotations
 
+import ast
 import datetime
 import html
 import json
@@ -77,15 +78,46 @@ def _port_free(host: str, port: int) -> bool:
 
 
 # --------------------------------------------------------------------------- helpers
+def _as_collection(v):
+    """Return v as a list of items if it's collection-like, else None.
+
+    Handles list / tuple / set, numpy & pandas arrays (anything with .tolist()), and
+    stringified collections like "{'7735551234', '7735555678'}" (parquet -> array, but
+    CSV round-trips them to strings). Plain scalars / strings return None.
+    """
+    if isinstance(v, (list, tuple, set, frozenset)):
+        return list(v)
+    if isinstance(v, str):
+        s = v.strip()
+        if len(s) >= 2 and s[0] in '[{(' and s[-1] in ']})':
+            try:
+                parsed = ast.literal_eval(s)
+                if isinstance(parsed, (list, tuple, set, frozenset)):
+                    return list(parsed)
+            except (ValueError, SyntaxError):
+                pass
+        return None
+    if isinstance(v, bytes):
+        return None
+    if hasattr(v, 'tolist'):  # numpy / pandas array
+        try:
+            out = v.tolist()
+            return out if isinstance(out, list) else None
+        except Exception:
+            return None
+    return None
+
+
 def _is_missing(v) -> bool:
     if v is None:
         return True
+    coll = _as_collection(v)
+    if coll is not None:  # collection: missing iff it has no non-missing element
+        return all(_is_missing(x) for x in coll)
     if isinstance(v, float) and pd.isna(v):
         return True
     if isinstance(v, str):
         return v.strip() == ''
-    if isinstance(v, list):
-        return len(v) == 0
     return False
 
 
@@ -99,23 +131,29 @@ def _to_bool(v) -> bool:
 
 
 def _fmt(v) -> str:
+    coll = _as_collection(v)
+    if coll is not None:
+        return ', '.join(str(x) for x in coll if not _is_missing(x))
     if _is_missing(v):
         return ''
-    if isinstance(v, list):
-        return ', '.join(str(x) for x in v)
     return str(v)
 
 
 def _cell_class(a, b) -> str:
-    """Same colour rules as the notebook's show_pairs, returned as a CSS class name."""
+    """Same colour rules as the notebook's show_pairs, returned as a CSS class name.
+
+    Collection fields (e.g. Phones_set) are GREEN if A and B share *any* element -- they do
+    not all have to agree.
+    """
     am, bm = _is_missing(a), _is_missing(b)
     if am and bm:
         return 'both-missing'
     if am or bm:
         return 'one-missing'
-    if isinstance(a, list) or isinstance(b, list):
-        sa = set(map(str, a)) if isinstance(a, list) else {str(a)}
-        sb = set(map(str, b)) if isinstance(b, list) else {str(b)}
+    ca, cb = _as_collection(a), _as_collection(b)
+    if ca is not None or cb is not None:
+        sa = {str(x) for x in ca} if ca is not None else {str(a)}
+        sb = {str(x) for x in cb} if cb is not None else {str(b)}
         return 'equal' if sa & sb else 'diff'
     return 'equal' if str(a) == str(b) else 'diff'
 
